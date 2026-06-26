@@ -1,0 +1,29 @@
+# Core data processing
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10
+
+# Config
+PyYAML>=6.0
+
+# PRTG collector
+requests>=2.31
+
+# Model training
+scikit-learn>=1.3
+joblib>=1.3
+
+# Orchestrator scheduling
+APScheduler>=3.10
+
+# API
+fastapi>=0.110
+uvicorn[standard]>=0.27
+httpx>=0.27
+
+# Optional: live inference Kafka publishing/consuming
+# (netflow_collector.py --publish-kafka, ingestion/stream_router.py run())
+# kafka-python>=2.0
+
+# Testing
+pytest>=8.0

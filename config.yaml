@@ -1,0 +1,34 @@
+system:
+  mode: observation
+  kafka_bootstrap: localhost:9092
+prtg:
+  base_url: https://prtg.example.local
+  api_token: ''
+  poll_interval_sec: 60
+  avg_interval_sec: 60
+  poll_lag_sec: 30
+devices:
+- ip: 10.0.0.5
+  name: core-router-01
+  building: HQ
+  sensors: {}
+- ip: 10.0.0.6
+  name: edge-switch-floor2
+  building: HQ
+  sensors: {}
+- ip: 10.0.0.7
+  name: branch-router-01
+  building: Branch-A
+  sensors: {}
+bootstrap:
+  min_collection_days: 14
+  min_netflow_records: 100000
+  training_hour_utc: 2
+  retrain_interval_days: 7
+  rolling_training_window_days: 90
+paths:
+  netflow_raw_dir: data/raw
+  prtg_raw_dir: data/raw
+  processed_dir: data/processed
+  models_dir: data/models
+  alerts_dir: data/alerts
