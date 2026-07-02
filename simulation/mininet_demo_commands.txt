@@ -1,0 +1,13 @@
+# Normal baseline traffic
+h1 ping -c 10 10.0.3.10
+h2 curl http://10.0.3.10/
+h3 ping -c 10 10.0.1.11
+h4 iperf -c 10.0.3.10 -t 30
+
+# Controlled anomaly traffic
+h1 iperf -c 10.0.3.10 -t 60
+h2 nmap -p 1-200 10.0.3.10
+h1 iperf -u -c 10.0.3.10 -p 53 -b 5M -t 30
+
+# Node mapping
+# h1=finance-pc, h2=staff-pc, h3=branch-pc, h4=branch-server, h5=web-server, h6=dns-server

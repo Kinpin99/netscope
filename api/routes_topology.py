@@ -1,3 +1,10 @@
+"""
+Building-grouped network view (must_add_to_project.txt item 1):
+"Allows administrators to view issues about network access, network
+congestion, device status, and error packets from the perspective of
+buildings."
+"""
+
 import sys
 from pathlib import Path
 
@@ -16,7 +23,11 @@ def _get_builder() -> TopologyBuilder:
 
 @router.get("/buildings")
 def building_view():
-
+    """
+    One entry per building with device count, open issue count, max
+    severity, average health score, and the full list of devices in that
+    building (each with its own health/status).
+    """
     builder = _get_builder()
     return {"buildings": builder.building_view()}
 

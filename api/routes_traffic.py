@@ -1,3 +1,20 @@
+"""
+Recent traffic data for dashboard charts. Two endpoints:
+
+  /traffic/recent       - raw NetFlow aggregates for the last N minutes,
+                           per device (for "Live Traffic" charts)
+  /traffic/live-scores  - runs the ensemble detector on the most recent
+                           window of data and returns per-detector scores
+                           without persisting alerts (a read-only "what
+                           would the system say about right now" view,
+                           useful for the dashboard's live panel without
+                           waiting for stream_router's next scheduled tick)
+
+Both endpoints degrade gracefully during the observation phase: /recent
+still works (it's just aggregating raw data), /live-scores returns NaN
+scores via ensemble_detector's documented no-model behavior.
+"""
+
 import math
 import sys
 import time
@@ -28,7 +45,22 @@ def _get_cfg():
 def recent_traffic(
     minutes: int = Query(15, ge=1, le=1440, description="How many minutes of recent data to aggregate"),
 ):
+    """
+    Per-device, per-minute aggregates (bytes in/out, packet counts) for the
+    last `minutes` minutes - feeds the dashboard's "Live Traffic" chart.
 
+    Returns:
+        {
+          "window_sec": 60,
+          "devices": {
+            "10.0.0.5": [
+              {"window": <epoch>, "bytes_in": ..., "bytes_out": ..., "packets_in": ..., "packets_out": ...},
+              ...
+            ],
+            ...
+          }
+        }
+    """
     cfg = _get_cfg()
     nf = _load_netflow(str(cfg["paths"]["netflow_raw_dir"]))
     if nf.empty:
@@ -75,7 +107,13 @@ def recent_traffic(
 def live_scores(
     minutes: int = Query(1, ge=1, le=10, description="How many minutes of recent data to score"),
 ):
-
+    """
+    Run the ensemble detector on the most recent `minutes` of data and
+    return per-detector anomaly scores WITHOUT persisting alerts (read-only
+    preview - stream_router.py is the process that actually advances alert
+    state). NaN scores (e.g. observation phase, no models yet) are
+    serialized as null.
+    """
     cfg = _get_cfg()
     nf = _load_netflow(str(cfg["paths"]["netflow_raw_dir"]))
     snmp = _load_snmp(str(cfg["paths"]["prtg_raw_dir"]))
