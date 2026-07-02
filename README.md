@@ -8,7 +8,7 @@ and exposes everything through a REST API for a dashboard.
 
 The system is **self-bootstrapping**: on first run it collects data for a
 period, automatically trains its own models, evaluates them, and switches
-itself into live detection — no manual training step required. It then
+itself into live detection. No manual training step required. It then
 retrains itself on a schedule, automatically rolling back if a retrain
 produces a worse model.
 
