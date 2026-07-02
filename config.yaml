@@ -32,3 +32,31 @@ paths:
   processed_dir: data/processed
   models_dir: data/models
   alerts_dir: data/alerts
+snmp_prtg:
+  community: public
+  poll_interval_sec: 60
+  timeout_sec: 2
+  retries: 1
+
+
+security:
+  # Set NETSCOPE_JWT_SECRET in production. If omitted, the API generates an
+  # ephemeral in-memory secret, which logs users out on restart.
+  token_ttl_minutes: 480
+  users_file: data/security/users.json
+  audit_log_path: data/audit/audit.log
+  allow_registration: false
+  login_max_failures: 5
+  login_lockout_minutes: 15
+  cors_allowed_origins:
+  - http://localhost:5173
+  - http://127.0.0.1:5173
+  # Turn this on in production after setting the CIDRs for your LAN/NOC subnet.
+  enforce_ip_allowlist: false
+  allowed_cidrs:
+  - 127.0.0.1/32
+  - ::1/128
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+  force_https: false

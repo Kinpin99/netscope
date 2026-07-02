@@ -1,513 +1,445 @@
-**AI-Powered Network Anomaly Detection & Network Health Dashboard**
+# AI-Powered Network Anomaly Detection & Network Health Dashboard
+
+A fully automated pipeline that collects network telemetry (NetFlow + PRTG),
+learns "normal" behavior for your network, detects anomalies across four
+dimensions (bandwidth spikes, port scans, device behavior, protocol misuse),
+raises classified/severity-ranked alerts, computes per-device health scores,
+and exposes everything through a REST API for a dashboard.
+
+The system is **self-bootstrapping**: on first run it collects data for a
+period, automatically trains its own models, evaluates them, and switches
+itself into live detection — no manual training step required. It then
+retrains itself on a schedule, automatically rolling back if a retrain
+produces a worse model.
 
 ---
 
-## Table of Contents
-
-1. [Project Overview](#1-project-overview)
-2. [System Architecture](#2-system-architecture)
-3. [Directory Structure](#3-directory-structure)
-4. [Data Flow](#4-data-flow)
-5. [Configuration Reference](#5-configuration-reference)
-6. [Collectors](#6-collectors)
-7. [Preprocessing Pipeline](#7-preprocessing-pipeline)
-8. [Training Pipeline](#8-training-pipeline)
-9. [Orchestrator & Lifecycle](#9-orchestrator--lifecycle)
-10. [Live Inference](#10-live-inference)
-11. [Alerting System](#11-alerting-system)
-12. [Topology & Health](#12-topology--health)
-13. [REST API Reference](#13-rest-api-reference)
-14. [Dashboard Frontend](#14-dashboard-frontend)
-
-
----
-
-## 1. Project Overview
-
-Netscope is an autonomous network monitoring backend that:
-
-- **Collects** raw telemetry from network devices via NetFlow v5/v9 (per-flow records) and PRTG's REST API (interface traffic, CPU, memory, error counters).
-- **Learns** what normal looks like for your network automatically — no manual threshold-setting, no labelling required for initial deployment.
-- **Detects** four categories of network anomaly using Isolation Forest models trained on engineered features.
-- **Classifies** every anomaly with a severity level and a named issue type that maps to standard network operations categories.
-- **Alerts** through a deduplicated alert lifecycle (open → update → close) rather than firing a new alert for every anomalous window.
-- **Heals itself** by retraining on a schedule, evaluating new models against a held-out split before promoting them, and rolling back automatically if a retrain produces a worse model.
-- **Exposes** everything through a FastAPI REST API consumed by a React dashboard.
-
-The system is designed around one central principle: **the training code and the live inference code use the same feature-computation functions**. There is no separate "offline" and "online" preprocessing — both paths call the same Python functions in `unified_preprocessing.py`, differing only in how they read data (CSV vs in-memory DataFrame). This eliminates the most common production failure mode in ML systems: silent feature mismatch between training and serving.
-
----
-
-## 2. System Architecture
-
-### High-Level Overview
+## 1. High-Level Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                  Network Devices                     │
-│          Routers · Switches · Access Points          │
-└──────────┬──────────────────────────┬───────────────┘
-           │ NetFlow v5/v9 UDP        │ PRTG Sensors
-           │ (per-flow records)       │ (aggregated metrics)
-           ▼                          ▼
-┌──────────────────┐       ┌────────────────────────────┐
-│ netflow_          │       │ prtg_collector.py          │
-│ collector.py      │       │                            │
-│                  │       │ Polls PRTG REST API for:   │
-│ UDP listener on  │       │  · if_in/out_octets        │
-│ port 2055        │       │  · cpu_load_pct            │
-│ Parses v5 + v9   │       │  · mem_used_pct            │
-│ (per-exporter    │       │  · if_in_errors            │
-│  template cache) │       │  · if_speed                │
-└────────┬─────────┘       └──────────┬─────────────────┘
-         │                            │
-         │ CSV (training)  or  Kafka (live inference)
-         ▼                            ▼
-    data/raw/                  Kafka topics:
-    netflow_raw_<date>.csv       netflow-raw
-    prtg_raw_<date>.csv          prtg-metrics
-         │                            │
-         └────────────┬───────────────┘
-                      │
-         ┌────────────▼────────────────────────────────┐
-         │      preprocessing/unified_preprocessing.py  │
-         │                                              │
-         │  from_csv()  ──────►  Feature DataFrames     │
-         │  from_stream()        (training / inference) │
-         │                                              │
-         │  4 feature classes (one per detector):       │
-         │   BandwidthFeatures                          │
-         │   PortScanFeatures                           │
-         │   DeviceBehaviorFeatures                     │
-         │   ProtocolFeatures                           │
-         └──────┬──────────────────────────────────────┘
-                │
-        ┌───────┴───────────────────────┐
-        │                               │
-        ▼  (training path)              ▼  (inference path)
-┌────────────────────┐        ┌─────────────────────────────┐
-│  training/         │        │  ingestion/stream_router.py │
-│  train_*.py        │        │                             │
-│  evaluate_models.py│        │  SlidingWindowBuffer        │
-│                    │        │  (60s windows, watermark    │
-│  Isolation Forest  │        │   flush on later window or  │
-│  or Random Forest  │        │   10s grace period)         │
-│                    │        │          │                   │
-│  data/models/*.pkl │        │          ▼                   │
-│  normalization_    │        │  detectors/                  │
-│  stats.json        │        │  ensemble_detector.py       │
-└────────┬───────────┘        │                             │
-         │                    │  ModelBundle.score_window() │
-         │                    │  (all 4 detectors parallel) │
-         │                    └─────────────┬───────────────┘
-         │                                  │
-         └──────────────────────────────────┘
-                        │
-                        ▼
-         ┌──────────────────────────────────┐
-         │  orchestrator/orchestrator.py    │
-         │                                  │
-         │  OBSERVATION → TRAINING →        │
-         │  INFERENCE → (retrain)           │
-         │                                  │
-         │  archive → train → evaluate      │
-         │  → promote or rollback           │
-         └──────────────┬───────────────────┘
-                        │
-                        ▼
-         ┌──────────────────────────────────┐
-         │  alerts/alert_engine.py          │
-         │                                  │
-         │  score → severity                │
-         │  → issue classification          │
-         │  → dedup (open/update/close)     │
-         │  → health scores                 │
-         └──────────────┬───────────────────┘
-                        │
-               ┌────────┴─────────┐
-               ▼                  ▼
-    data/alerts/            data/health_scores.json
-    alerts_<date>.json
-               │
-               └──────────────────────────────────┐
-                                                  ▼
-                                    ┌─────────────────────────┐
-                                    │  api/main.py (FastAPI)  │
-                                    │                         │
-                                    │  /system  /devices      │
-                                    │  /alerts  /topology     │
-                                    │  /traffic               │
-                                    └───────────┬─────────────┘
-                                                │
-                                                ▼
-                                   dashboard/frontend/ (React)
-                                   Overview · Devices · Alerts
-                                   Traffic · Device Detail
+                Network Devices (Routers/Switches)
+                         |
+          +--------------+--------------------+
+          |                                    |
+   NetFlow Export (UDP)                  PRTG Sensors
+          |                                    |
+          v                                    v
+  collectors/netflow_collector.py    collectors/prtg_collector.py
+          |                                    |
+          +----------------+-------------------+
+                            |
+              data/raw/netflow_raw_<date>.csv
+              data/raw/prtg_raw_<date>.csv
+              (daily-rotated; OR Kafka topics in live mode)
+                            |
+                            v
+            preprocessing/unified_preprocessing.py
+        (ONE feature-computation codebase for both
+         training [from_csv] and live inference [from_stream])
+                            |
+              +-------------+-------------+
+              |                           |
+              v                           v
+   training/train_*.py            detectors/ensemble_detector.py
+   (Isolation Forest /                   |
+    Random Forest)                       v
+              |                  alerts/alert_engine.py
+              v                  (severity, issue type,
+   data/models/*.pkl              dedup, health scores)
+   normalization_stats.json              |
+              ^                           v
+              |                  data/alerts/*.json
+   orchestrator/orchestrator.py   data/health_scores.json
+   (lifecycle: observation ->            |
+    training -> inference,               v
+    retraining, rollback)          api/main.py (FastAPI)
+                            |             |
+                            +-------------+
+                                          |
+                                          v
+                              dashboard/frontend/
+                         (React + Vite, served from dist/)
 ```
 
-### Component Responsibilities
+---
 
-| Component | Responsibility | Stateful? |
+## 2. The Four Detectors
+
+Each detector is an Isolation Forest (unsupervised) trained on engineered
+features. Per `anomaly_features.txt`, only Random Forest and Isolation
+Forest are used (Random Forest is supported as a drop-in for the port scan
+detector if labelled data becomes available — see `training/train_portscan_model.py`).
+
+| Detector | Entity keyed by | What it catches |
 |---|---|---|
-| `collectors/` | Raw telemetry ingestion to CSV/Kafka | No (append-only write) |
-| `preprocessing/` | Feature computation for training and inference | No (pure transforms) |
-| `training/` | Model fitting, evaluation gating, normalization stats | No (reads CSVs, writes models) |
-| `orchestrator/` | Lifecycle state machine, retraining schedule, rollback | Yes (`system_state.json`) |
-| `detectors/` | Live scoring using trained model bundles | No (reads models, scores DataFrames) |
-| `ingestion/` | Kafka consume loop, sliding window buffer, per-window dispatch | Yes (in-memory window buffers) |
-| `alerts/` | Severity/classification, alert lifecycle, health scores | Yes (`data/alerts/`, `health_scores.json`) |
-| `topology/` | Building-grouped views, device status aggregation | No (reads config + alerts) |
-| `api/` | REST endpoints for the dashboard | No (reads all the above) |
-| `dashboard/frontend/` | React SPA consuming the API | No (browser state only) |
+| **Bandwidth** | `device_ip` | Sudden traffic spikes, link saturation (via z-scores + interface utilization from PRTG) |
+| **Port Scan** | `src_ip` | Many distinct ports/destinations, high SYN ratio, low port entropy |
+| **Device Behavior** | `device_ip` | A device's traffic profile (volume, protocol mix, destinations, time-of-day) deviating from its own history |
+| **Protocol** | `device_ip` | Unusual protocol mix, KL-divergence from the device's baseline distribution, port/protocol mismatches |
+
+All four share **one** feature-computation codebase
+(`preprocessing/unified_preprocessing.py`), each with a `from_csv()` path
+(training, reads CSV files/directories) and a `from_stream()` path (live
+inference, reads in-memory DataFrames from Kafka). This guarantees training
+and live inference compute features identically — the single biggest risk
+in this kind of system.
 
 ---
 
-## 3. Directory Structure
+## 3. Data Collection
 
-```
-network-anomaly-detection/
-│
-├── config.yaml                      # Single config for all components
-├── requirements.txt
-├── README.md
-├── DOCUMENTATION.md                 # This file
-│
-├── collectors/
-│   ├── netflow_collector.py         # NetFlow v5/v9 UDP listener + pcap parser
-│   └── packet_utils.py             # v5/v9 packet parsing, per-exporter template cache
-│
-├── collectors/
-│   └── prtg_collector.py           # PRTG REST API poller + backfill mode
-│
-├── preprocessing/
-│   └── unified_preprocessing.py    # THE feature computation module:
-│                                   #   BandwidthFeatures
-│                                   #   PortScanFeatures
-│                                   #   DeviceBehaviorFeatures
-│                                   #   ProtocolFeatures
-│                                   # from_csv() + from_stream() for each
-│
-├── training/
-│   ├── common.py                   # Shared utilities: save/load model bundle,
-│   │                               # feature column selection, train/eval split
-│   ├── train_bandwidth_model.py
-│   ├── train_portscan_model.py     # Supports IF (default) or RF (if labels present)
-│   ├── train_device_model.py       # --mode global | --mode per-device --device-ip
-│   ├── train_protocol_model.py     # Also generates protocol_baseline.csv
-│   └── evaluate_models.py          # Evaluation gate (exits 1 if any model fails)
-│
-├── orchestrator/
-│   ├── system_state.py             # Phase persistence (system_state.json)
-│   ├── orchestrator.py             # Lifecycle manager + subprocess runner
-│   └── scheduler.py               # APScheduler wrapper (continuous mode)
-│
-├── detectors/
-│   └── ensemble_detector.py        # ModelBundle + score_window()
-│
-├── ingestion/
-│   ├── sliding_window.py           # Timestamp-keyed window buffer
-│   └── stream_router.py            # Kafka consume loop + per-window dispatch
-│
-├── alerts/
-│   ├── risk_scoring.py             # score_to_severity, classify_issue_type,
-│   │                               # compute_health_score (all pure functions)
-│   ├── alert_store.py              # JSON persistence, open/close lifecycle
-│   └── alert_engine.py             # process_window(), issue_distribution(),
-│                                   # health score persistence
-│
-├── topology/
-│   └── topology_builder.py         # building_view(), device_list(), device_detail()
-│
-├── api/
-│   ├── main.py                     # FastAPI app, CORS, router mounting
-│   ├── routes_system.py            # GET /system/status, POST /system/retrain
-│   ├── routes_devices.py           # GET /devices/:ip, POST/DELETE /devices/:ip/baseline
-│   ├── routes_alerts.py            # GET /alerts, /alerts/open, /alerts/distribution,
-│   │                               #     /alerts/health-scores
-│   ├── routes_topology.py          # GET /topology/buildings, /topology/devices
-│   └── routes_traffic.py           # GET /traffic/recent, /traffic/live-scores
-│
-├── utils/
-│   └── config_loader.py            # load_config(), resolves paths + env vars
-│
-├── dashboard/frontend/
-│   ├── package.json
-│   ├── vite.config.js              # Dev server + /api proxy to FastAPI
-│   ├── index.html
-│   ├── src/
-│   │   ├── main.jsx
-│   │   ├── App.jsx                 # Shell: sidebar nav, status banner, routes
-│   │   ├── index.css               # Design tokens, layout, component styles
-│   │   ├── api/client.js           # Thin fetch wrapper for all endpoints
-│   │   ├── hooks/usePolling.js     # Auto-refreshing data hook
-│   │   ├── utils/format.js         # Severity, bytes, relative-time formatters
-│   │   ├── components/
-│   │   │   ├── Shared.jsx          # SeverityBadge, StatusDot, HealthScore,
-│   │   │   │                       # PulseStrip, EmptyState, ErrorBanner, AlertItem
-│   │   │   └── StatusBanner.jsx    # System phase banner with retrain button
-│   │   └── pages/
-│   │       ├── Overview.jsx        # Building cards + open alerts
-│   │       ├── Devices.jsx         # Sortable device table
-│   │       ├── DeviceDetail.jsx    # Device health, alerts, baseline controls
-│   │       ├── Alerts.jsx          # Issue distribution + alert history
-│   │       └── Traffic.jsx         # Bandwidth charts + live scores
-│   └── dist/                       # Production build output
-│
-├── tests/
-│   ├── test_preprocessing.py
-│   ├── test_collectors.py
-│   ├── test_prtg_collector.py
-│   ├── test_training.py
-│   ├── test_orchestrator.py        # Integration tests (runs real subprocesses)
-│   ├── test_ensemble_detector.py
-│   ├── test_alerts.py
-│   ├── test_stream_router.py
-│   └── test_api.py                 # Integration tests (TestClient + real models)
-│
-└── data/
-    ├── raw/                         # Daily-rotated CSVs from collectors
-    ├── processed/                   # Feature CSVs from train_*.py runs
-    ├── models/                      # *.pkl bundles, normalization_stats.json,
-    │   ├── archive/                 # Previous model snapshots for rollback
-    │   ├── device_profiles/         # Per-device model bundles
-    │   └── system_state.json        # Orchestrator phase persistence
-    ├── alerts/                      # Daily-rotated alert JSON files
-    ├── health_scores.json           # Latest per-device health scores
-    └── test_fixtures/               # Synthetic data for local testing
-```
+### NetFlow (`collectors/netflow_collector.py`)
+- Listens on UDP (default port 2055) for NetFlow v5/v9 exports, or parses a `.pcap` file for offline/synthetic data.
+- NetFlow v9 template cache is keyed by **(exporter IP, template_id)** — multiple routers reusing the same template ID with different field layouts won't corrupt each other's parsing.
+- Output: daily-rotated CSVs `data/raw/netflow_raw_<YYYY-MM-DD>.csv`. Old days can be deleted independently (supports the 90-day rolling retraining window).
+- `--publish-kafka` additionally publishes each flow record as JSON to a Kafka topic (`netflow-raw` by default) for live inference (Phase 3). CSV writing can be disabled with `--no-csv` once Kafka is the only consumer needed.
+
+### PRTG (`collectors/prtg_collector.py`)
+- Polls PRTG's `historicdata.json` REST API per configured sensor (traffic in/out, errors, CPU, memory) and merges them into rows matching the exact schema `unified_preprocessing._load_snmp()` expects: `timestamp, device_ip, if_in_octets, if_out_octets, if_speed, if_in_errors, cpu_load_pct, mem_used_pct`.
+- `if_speed` comes from `config.yaml` per device (PRTG traffic sensors don't reliably expose nominal link speed as a channel).
+- Two modes:
+  - `--mode poll`: continuous 60s polling loop (Phase 1-3).
+  - `--mode backfill --days N`: one-shot historical pull — if PRTG already has weeks of stored data, backfill it immediately instead of waiting through the observation phase in real time.
+- Output: daily-rotated `data/raw/prtg_raw_<YYYY-MM-DD>.csv`, same convention as NetFlow.
+
+**Note on per-flow data**: PRTG only retains interface-level aggregates, not
+per-flow records. The port scan and protocol detectors need per-flow detail
+(distinct ports/IPs, protocol mix per flow), so `netflow_collector.py` is
+kept as a lightweight parallel collector specifically for that data — PRTG
+covers bandwidth/CPU/memory/errors, NetFlow covers per-flow detail.
 
 ---
 
-## 4. Data Flow
+## 4. Preprocessing (`preprocessing/unified_preprocessing.py`)
 
-### Training Path
+Computes all four detectors' feature sets from raw NetFlow + PRTG data.
 
-```
-netflow_raw_<date>.csv          prtg_raw_<date>.csv
-         │                               │
-         └──────────┬────────────────────┘
-                    │
-                    ▼
-    unified_preprocessing.*.from_csv()
-                    │
-         ┌──────────┼─────────────────────────────────┐
-         ▼          ▼            ▼                     ▼
-  bandwidth_  portscan_   device_behavior_   protocol_
-  features    features    features           features
-  .csv        .csv        .csv               .csv
-         │          │            │                     │
-         └──────────┴────────────┴─────────────────────┘
-                    │
-              train_*.py (one per detector)
-                    │
-         ┌──────────┼─────────────────────────────────┐
-         ▼          ▼            ▼                     ▼
-  bandwidth_  portscan_   device_model.   protocol_
-  model.pkl   model.pkl   pkl             model.pkl
-                    │
-              normalization_stats.json
-              protocol_baseline.csv
-```
+Key shared logic:
+- **`_assign_device_ip(df)`**: determines which IP in a flow is "the device
+  being profiled". If the destination is a private (RFC-1918) address, the
+  flow is inbound to a monitored device, so `dst_ip` is the device;
+  otherwise `src_ip` is. This ensures inbound traffic from an external
+  attacker is attributed to the **internal device being attacked**, not the
+  external attacker's IP — critical for the device-behavior and protocol
+  detectors to actually see attacks against internal devices.
+- **Two feature-computation paths per detector**:
+  - `from_csv(...)`: training. Loads CSVs (or directories of daily-rotated
+    CSVs), computes rolling z-scores from in-data history
+    (`_rolling_zscore`, 1440-window rolling mean/std).
+  - `from_stream(...)`: live inference. Takes in-memory DataFrames (from
+    Kafka), computes z-scores against **persisted** per-device
+    `normalization_stats.json` (`_apply_stats_zscore`) rather than
+    recomputing rolling stats from a tiny 1-minute batch — without this,
+    live z-scores would always be ~0 regardless of how anomalous traffic
+    is, because there's no history in a single Kafka window.
+- **`build_all_features()`**: convenience wrapper computing all four
+  feature sets from raw CSVs in one call (used by training).
+- **`build_all_normalization_stats()`**: computes per-device mean/std for
+  the z-score columns, written to `normalization_stats.json` by the
+  training scripts and consumed by `from_stream()`.
+- **Protocol baseline bootstrapping**: `protocol_baseline.csv` (per-device
+  expected protocol mix) doesn't exist on the very first run.
+  `_load_baseline()` returns `{}` in that case (KL-divergence = 0 for
+  every row on that first run only); `train_protocol_model.py` then writes
+  a fresh baseline from that run's data for next time.
 
-### Live Inference Path (Phase 3)
+---
 
-```
-Kafka: netflow-raw          Kafka: prtg-metrics
-         │                          │
-         ▼                          ▼
-   SlidingWindowBuffer        SlidingWindowBuffer
-   (60s buckets, keyed        (60s buckets)
-    by record timestamp)
-         │                          │
-         └──────────┬───────────────┘
-                    │  (flush when window complete)
-                    ▼
-        stream_router.process_one_window()
-                    │
-                    ▼
-   unified_preprocessing.*.from_stream(
-       netflow_df, snmp_df,
-       normalization_stats=stats  ← loaded from normalization_stats.json
-   )
-                    │
-                    ▼
-   ensemble_detector.score_window()
-   → scores_df [detector, entity_id, window, anomaly_score, features]
-                    │
-                    ▼
-   alert_engine.process_window(scores_df)
-   → severity classification
-   → issue type classification
-   → dedup: open / update / close alerts
-   → health score update
-```
+## 5. Training (`training/`)
 
-### Key Data Contracts
+Each `train_*.py` script:
+1. Computes its feature set via `unified_preprocessing.*.from_csv(...)`
+2. Splits train/eval **time-aware** (last 20% of windows by timestamp = eval set — more realistic than a random split for time-series anomaly data)
+3. Trains an Isolation Forest (`contamination="auto"` by default)
+4. Saves a **model bundle** (`training/common.py:save_model`) containing the
+   fitted model, the exact `feature_columns` list (and order!) used for
+   training, model type, training row count, and timestamp. This bundle is
+   the train/inference contract — live inference rebuilds its feature
+   vector using this exact column list via `to_matrix()`, filling any
+   missing columns with 0.
+5. Writes its slice of `normalization_stats.json`
 
-**netflow_raw_<date>.csv** (produced by `netflow_collector.py`):
-```
-timestamp, src_ip, dst_ip, src_port, dst_port, protocol,
-tcp_flags, packets, bytes, duration_sec
-```
+| Script | Output | Notes |
+|---|---|---|
+| `train_bandwidth_model.py` | `bandwidth_model.pkl` | |
+| `train_portscan_model.py` | `portscan_model.pkl` | Switches to Random Forest automatically if a `label` column is present (for future labelled data e.g. CICIDS2017) |
+| `train_device_model.py` | `device_model.pkl` (`--mode global`) or `device_profiles/<ip>_model.pkl` (`--mode per-device --device-ip <ip>`) | Per-device mode implements the on-request "normal baseline" feature |
+| `train_protocol_model.py` | `protocol_model.pkl` + refreshes `protocol_baseline.csv` | |
 
-**prtg_raw_<date>.csv** (produced by `prtg_collector.py`):
-```
-timestamp, device_ip, if_in_octets, if_out_octets, if_speed,
-if_in_errors, cpu_load_pct, mem_used_pct
-```
+### Evaluation gate (`training/evaluate_models.py`)
+After all four scripts run, this checks each model:
+- Loads without error, has required bundle keys
+- Every `feature_column` the model expects exists in the current processed
+  features (catches `unified_preprocessing.py` drifting out of sync with
+  already-trained models)
+- Evaluation-split scores aren't degenerate (not all-identical, not NaN,
+  within `[0,1]`)
+- For Random Forest models with labels: eval accuracy ≥ 0.6
 
-**Model bundle** (produced by `training/common.py:save_model()`):
-```python
-{
-  "model": <sklearn estimator>,
-  "feature_columns": ["col1", "col2", ...],  # exact order matters for scoring
-  "model_type": "isolation_forest" | "random_forest",
-  "trained_at": <epoch float>,
-  "training_rows": <int>,
-  # + any extra_meta passed by the training script
-}
+Exits non-zero if anything fails — this is the gate the orchestrator uses to
+decide whether to promote or roll back a training run.
+
+---
+
+## 6. The Automated Lifecycle (`orchestrator/`)
+
+### Phases
+```
+OBSERVATION  --(enough data collected)-->  TRAINING  --(eval passed)-->  INFERENCE
+                                                |                              |
+                                                +--(eval failed, rollback)-----+
+                                                                               |
+                                          (retrain_interval_days elapses) -----+
+                                                                               |
+                                                                   back to TRAINING
 ```
 
-**normalization_stats.json** (produced during training, consumed during live inference):
+State is persisted in `data/models/system_state.json`
+(`orchestrator/system_state.py`):
 ```json
 {
-  "bandwidth": {
-    "10.0.0.5": { "bw_in_bytes_mean": 7806.0, "bw_in_bytes_std": 4695.0, ... },
-    "10.0.0.6": { ... }
-  },
-  "device_behavior": {
-    "10.0.0.5": { "bytes_in_mean": ..., "bytes_in_std": ..., ... }
-  },
-  "device_behavior_profiles": {
-    "10.0.0.5": { ... }  // per-device baseline stats, if trained
-  }
+  "phase": "observation" | "training" | "inference",
+  "observation_started_at": <epoch>,
+  "last_training_result": "passed" | "failed" | null,
+  "models_version": <int>,
+  "last_retrain_at": <epoch>,
+  "notes": "human-readable status for the dashboard"
 }
 ```
 
-**score_window() output DataFrame**:
-```
-detector     | entity_id    | window     | anomaly_score | profile_used | features
--------------|--------------|------------|---------------|--------------|--------
-"bandwidth"  | "10.0.0.5"  | 1718000060 | 0.6234        | "global"     | {...}
-"portscan"   | "203.0.113.5"| 1718000060 | 0.8901        | "global"     | {...}
-"device_...  | "10.0.0.5"  | 1718000060 | 0.5512        | "per_device" | {...}
-"protocol"   | "10.0.0.5"  | 1718000060 | NaN           | "global"     | {...}
-```
-`anomaly_score` is `NaN` when no model is loaded (observation phase). This
-means "no opinion" — never treated as "definitely normal."
+### Observation phase
+- `SystemOrchestrator.observation_status()` checks two thresholds from
+  `config.yaml`'s `bootstrap` section:
+  - `min_collection_days` (wall-clock time since `observation_started_at`)
+  - `min_netflow_records` (rows currently in `data/raw/netflow_raw_*.csv`)
+- Defaults: 14 days, 100,000 records. Two weeks gives at least two full
+  weekday/weekend cycles so the model learns that weekend traffic looks
+  different from Monday morning traffic.
+- **No anomaly detection runs during observation** — the system is purely
+  collecting and saving data.
+- If PRTG already has weeks of historical data, `prtg_collector.py
+  --mode backfill --days N` can pull it immediately, dramatically shortening
+  the real-time wait (the NetFlow side still needs live capture unless you
+  have pcap captures to feed via `netflow_collector.py --mode pcap`).
 
-**Alert JSON schema** (one entry in `data/alerts/alerts_<date>.json`):
-```json
-{
-  "id": "<uuid>",
-  "detector": "bandwidth | portscan | device_behavior | protocol",
-  "entity_id": "<device_ip or suspected scanner IP>",
-  "issue_type": "network_congestion | device_capacity | connectivity_security | device_environment | network_performance",
-  "severity": "info | low | medium | high | critical",
-  "status": "open | closed",
-  "first_window": 1718000060,
-  "last_window": 1718000180,
-  "window_count": 3,
-  "max_score": 0.8901,
-  "last_score": 0.8412,
-  "building": "HQ",
-  "device_name": "core-router-01",
-  "profile_used": "global | per_device",
-  "created_at": 1718000065.32,
-  "updated_at": 1718000185.11,
-  "closed_at": null
-}
+### Training phase (`SystemOrchestrator.trigger_training_now()`)
+1. **Archive**: copy current `data/models/*.pkl` +
+   `normalization_stats.json` + `device_profiles/` to
+   `data/models/archive/<timestamp>/` (rollback point)
+2. Run all four `train_*.py` scripts as subprocesses (sequential)
+3. Run `evaluate_models.py`
+4. **Pass** → promote (archive kept as history, `models_version++`,
+   transition to INFERENCE)
+5. **Fail** → **rollback**: copy the archived (previous) artifacts back
+   over the freshly-trained (failing) ones, stay in INFERENCE if a model
+   had previously succeeded (`models_version > 0`), or fall back to
+   OBSERVATION if this was the very first training attempt (so the system
+   keeps collecting and retries automatically)
+6. Archive directory pruned to the last 10 snapshots
+
+### Inference phase
+- `_retrain_due()` checks `retrain_interval_days` (default 7) against
+  `last_retrain_at`. When due, runs the same training pipeline as above
+  (archive → train → evaluate → promote/rollback) — i.e. retraining uses
+  identical logic to initial training, just triggered on a schedule instead
+  of by the observation threshold.
+
+### Per-device baseline (`train_device_baseline(device_ip)`)
+Implements the "on user request, create a normal baseline for a particular
+device" requirement. This is **additive and isolated**:
+- Does NOT go through the archive/evaluate/promote pipeline for the four
+  global models
+- Writes to `data/models/device_profiles/<ip>_model.pkl` +
+  `normalization_stats.json["device_behavior_profiles"][<ip>]`
+- A bad per-device profile can't roll back or break the global models
+- Live inference (`ensemble_detector.py`) automatically prefers a device's
+  per-device profile over the global `device_model.pkl` when one exists
+
+### Running the orchestrator
+```bash
+# One tick (check phase, act if needed) - for cron/systemd timers
+python orchestrator/orchestrator.py
+
+# Force a training run regardless of phase/thresholds
+python orchestrator/orchestrator.py --force-train
+
+# Train a per-device baseline directly
+python orchestrator/orchestrator.py --device-baseline 10.0.0.5
+
+# OR: continuous in-process scheduler (ticks hourly by default)
+python orchestrator/scheduler.py --interval-minutes 60 --run-immediately
 ```
 
 ---
 
-## 5. Configuration Reference
+## 7. Live Inference (`detectors/ensemble_detector.py`, `ingestion/`)
 
-All configuration lives in `config.yaml` at the project root. Every
-component reads this file via `utils/config_loader.load_config()`. The
-resolved config is also accessible at runtime as `cfg["_config_path"]`
-(the absolute path to the file actually used), which the orchestrator
-passes to all training subprocesses via `--config` so they always read
-from the same file regardless of working directory.
+### ModelBundle
+Loaded once at startup:
+- The four global model bundles (`bandwidth_model.pkl`, etc.) — `None` if
+  not yet trained (observation phase)
+- `normalization_stats.json`
+- `protocol_baseline.csv`
+- Any per-device profiles (`device_profiles/*.pkl`)
+
+### `score_window(netflow_df, snmp_df, models)`
+Runs all four `from_stream()` feature computations and scores each with its
+model via `score_isolation_forest` (Isolation Forest `decision_function`,
+remapped so **higher = more anomalous**, clipped to `[0,1]`; ~0.5 is
+"typical"). Returns one row per `(detector, entity_id, window)`:
+
+```
+detector | entity_id | window | anomaly_score | profile_used | features
+```
+
+- `anomaly_score` is `NaN` if no model is loaded yet (observation phase) —
+  this means "no opinion", never treated as "definitely normal" by the
+  alert engine.
+- `profile_used` is `"per_device"` for device-behavior rows where a
+  per-device baseline exists and was used, `"global"` otherwise.
+- `features` carries the row's raw feature values (e.g. `if_util_in/out`)
+  for finer-grained issue classification downstream.
+
+### Sliding window + stream router (`ingestion/`)
+- `sliding_window.SlidingWindowBuffer`: buffers incoming records (keyed by
+  their own `timestamp`, not arrival time) into 60s buckets. A window
+  flushes once a strictly-later window has been seen, or after a 10s grace
+  period (so the most recent window still flushes even if traffic stops).
+- `stream_router.StreamRouter`: the Phase 3 main loop.
+  - Consumes Kafka topics `netflow-raw` and `prtg-metrics`
+  - `tick()`: flushes ready windows from both buffers, calls
+    `process_one_window()` for each
+  - `process_one_window()`: `score_window()` →
+    `AlertEngine.process_window()` — testable without Kafka
+  - **Model hot-reload**: each call checks `system_state.json`'s
+    `models_version`; if the orchestrator promoted new models since the
+    last check, calls `ModelBundle.reload()`. No restart needed after a
+    retrain.
+
+```bash
+# Requires kafka-python (optional dependency)
+python ingestion/stream_router.py
+```
+
+---
+
+## 8. Alerting & Health (`alerts/`)
+
+### Risk scoring (`alerts/risk_scoring.py`) — pure functions
+- **`score_to_severity(score)`**: `[0,1]` → `info | low | medium | high | critical` via fixed thresholds (0.55/0.65/0.75/0.85). `NaN` → `info`.
+- **`classify_issue_type(detector, features)`**: maps each detector to an issue category:
+  | Detector | Issue type |
+  |---|---|
+  | bandwidth (normal utilization) | `network_congestion` |
+  | bandwidth (utilization ≥ 0.85) | `device_capacity` |
+  | portscan | `connectivity_security` |
+  | device_behavior | `device_environment` |
+  | protocol | `network_performance` |
+- **`compute_health_score(detector_scores)`**: weighted combination of a
+  device's per-detector scores → `0-100` (100 = healthy). Scores below the
+  "typical" 0.5 threshold clamp to 100. NaN detectors are excluded and their
+  weight redistributed, so a device isn't penalized for detectors that
+  haven't been trained yet.
+
+### Alert lifecycle (`alerts/alert_store.py`, `alerts/alert_engine.py`)
+- Alerts persist as daily-rotated JSON (`data/alerts/alerts_<date>.json`)
+  with `status: open | closed`.
+- **Deduplication**: `AlertEngine.process_window()` finds any existing
+  `OPEN` alert for `(detector, entity_id)`. If the current window is still
+  anomalous, it *extends* that alert (`window_count++`, `max_score` updated,
+  severity can escalate but never de-escalate while open). If the score
+  drops back to `info`/below `MIN_ALERTABLE_SEVERITY` (`low`), the open
+  alert is **closed**.
+- `process_window()` returns ALL touched alerts (including closures) so a
+  caller can be notified when an issue resolves.
+- Rows with `NaN` scores are skipped entirely — neither open nor close an
+  alert based on "no opinion".
+- **Health scores**: `_update_health_scores()` persists per-device
+  `0-100` scores to `data/health_scores.json` using only the **latest**
+  window's scores across bandwidth/device_behavior/protocol (portscan
+  excluded — its `entity_id` is the suspected scanner, often not a managed
+  device).
+- **Issue distribution** (`issue_distribution(since, until)`): groups
+  alerts by entity with `issue_count`, `max_severity`, and the set of
+  `issue_types` seen — backs the "issue distribution view".
+
+---
+
+## 9. Topology & Buildings (`topology/topology_builder.py`)
+
+`TopologyBuilder.building_view()` groups devices by `config.yaml`'s
+`building` field (devices with no building → `"Unassigned"`), returning per
+building: device count, open issue count, max severity, average health
+score, and the full device list (each with health/status/open-issue-count).
+
+`device_detail(ip)` returns a single device's health, open alerts, and
+whether it has a per-device behavioral baseline.
+
+---
+
+## 10. REST API (`api/`)
+
+```bash
+uvicorn api.main:app --reload --port 8000
+# docs at http://localhost:8000/docs
+```
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/system/status` | GET | Current phase, observation progress, training result |
+| `/system/retrain` | POST | Manually trigger training (409 if already training) |
+| `/devices/{ip}` | GET | Device health, open alerts, per-device profile flag |
+| `/devices/{ip}/baseline` | POST | Train a per-device "normal baseline" |
+| `/devices/{ip}/baseline` | DELETE | Remove a per-device baseline (revert to global model) |
+| `/alerts/open` | GET | All currently-open alerts |
+| `/alerts` | GET | Historical alerts with filters: `since`, `until`, `last_hours`, `device_ip`, `building`, `severity`, `status` |
+| `/alerts/distribution` | GET | Issue distribution view (per-entity issue counts, max severity, issue types) |
+| `/alerts/health-scores` | GET | Current per-device 0-100 health scores |
+| `/topology/buildings` | GET | Building-grouped device/health/issue view |
+| `/topology/devices` | GET | Flat device list with health/status |
+| `/traffic/recent?minutes=N` | GET | Per-device bandwidth aggregates for charts |
+| `/traffic/live-scores` | GET | Read-only ensemble scoring preview of the most recent data (doesn't persist alerts) |
+
+All endpoints degrade gracefully during observation phase (empty results /
+`NaN`→`null` scores / `"unknown"` device status) rather than erroring.
+
+---
+
+## 11. Configuration (`config.yaml`)
+
+Single config file read by every component (`utils/config_loader.py`):
 
 ```yaml
-# =========================================================================
-# System mode — managed automatically by the orchestrator.
-# Override only if you need to manually force a phase for debugging.
-# =========================================================================
 system:
-  mode: observation                 # observation | training | inference
-  kafka_bootstrap: "localhost:9092" # Kafka broker for live inference (Phase 3)
+  mode: observation              # managed automatically by the orchestrator
+  kafka_bootstrap: "localhost:9092"
 
-# =========================================================================
-# PRTG connection
-# =========================================================================
 prtg:
   base_url: "https://prtg.example.local"
-  # API token. Prefer the PRTG_API_TOKEN environment variable over
-  # hardcoding here to avoid committing credentials.
-  api_token: ""
-  poll_interval_sec: 60             # How often to poll each sensor
-  avg_interval_sec: 60             # PRTG averaging interval (must match poll)
-  poll_lag_sec: 30                  # Backward lag to tolerate PRTG sensor delay
+  api_token: ""                  # prefer PRTG_API_TOKEN env var
+  poll_interval_sec: 60
+  avg_interval_sec: 60
+  poll_lag_sec: 30
 
-# =========================================================================
-# Device list
-#
-# Each entry must have:
-#   ip        — the management IP, must match the IPs that appear as
-#               src_ip/dst_ip in NetFlow records exported from that device.
-#               Mismatches here mean PRTG metrics won't join to NetFlow
-#               flows in unified_preprocessing.
-#   name      — human-readable label, shown in the dashboard
-#   building  — groups devices in the building-grouped view (item 1).
-#               Devices with no building are grouped under "Unassigned".
-#   sensors   — PRTG sensor IDs. Any sensor can be omitted; missing sensors
-#               produce 0/NaN for that column (same as the "no SNMP data"
-#               fallback in unified_preprocessing).
-# =========================================================================
 devices:
   - ip: "10.0.0.1"
     name: "core-router-01"
     building: "HQ"
     sensors:
-      traffic_in: 1001              # PRTG sensor ID for inbound traffic (bps)
-      traffic_out: 1002             # PRTG sensor ID for outbound traffic (bps)
-      if_speed_bps: 1000000000     # Nominal interface speed (from config,
-                                    # not PRTG — traffic sensors don't reliably
-                                    # expose this as a queryable channel)
-      if_errors: 1003               # Error/discard counter sensor
-      cpu: 1004                     # CPU utilisation % sensor
-      memory: 1005                  # Memory utilisation % sensor
+      traffic_in: 1001
+      traffic_out: 1002
+      if_speed_bps: 1000000000
+      if_errors: 1003
+      cpu: 1004
+      memory: 1005
 
-# =========================================================================
-# Bootstrap / retraining thresholds
-# =========================================================================
 bootstrap:
-  # Minimum time to spend in observation before attempting first training.
-  # 14 days gives at least two weekday/weekend cycles so the model learns
-  # that weekend traffic differs from weekday morning traffic.
   min_collection_days: 14
-
-  # Minimum NetFlow records in data/raw/ before training is triggered.
-  # 100,000 flows gives enough diversity across devices, protocols, and
-  # time-of-day patterns for a reasonable first model.
   min_netflow_records: 100000
-
-  # UTC hour at which the scheduler triggers training (0-23).
   training_hour_utc: 2
-
-  # Days between retrains in inference phase.
   retrain_interval_days: 7
-
-  # How many days of data the rolling retrain window includes.
-  # 90 days captures seasonal patterns without confusing the model with
-  # very old device configurations that no longer exist.
   rolling_training_window_days: 90
 
-# =========================================================================
-# Data paths (relative to project root; resolved to absolute on load)
-# =========================================================================
 paths:
   netflow_raw_dir: "data/raw"
   prtg_raw_dir: "data/raw"
@@ -516,879 +448,400 @@ paths:
   alerts_dir: "data/alerts"
 ```
 
-### Environment variables
-
-| Variable | Used by | Effect |
-|---|---|---|
-| `PRTG_API_TOKEN` | `prtg_collector.py` | Overrides `config.yaml`'s `prtg.api_token` |
+`load_config()` resolves relative paths to absolute (anchored at the project
+root), pulls `PRTG_API_TOKEN` from the environment if set, and records the
+resolved config path as `cfg["_config_path"]` so components that spawn
+subprocesses (the orchestrator) always pass `--config <same file>` —
+important when running under a non-default config (e.g. in tests).
 
 ---
 
-## 6. Collectors
+## 12. Running It End-to-End
 
-### 6.1 NetFlow Collector (`collectors/netflow_collector.py`)
+### Prerequisites
 
-Listens on a UDP socket for NetFlow exports from routers/switches and
-writes flow records to daily-rotated CSVs.
-
-#### Modes
-
-**UDP mode** (live collection):
 ```bash
-python collectors/netflow_collector.py \
-  --mode udp \
-  --host 0.0.0.0 \
-  --port 2055 \
-  [--publish-kafka] \
-  [--kafka-bootstrap localhost:9092] \
-  [--kafka-topic netflow-raw] \
-  [--no-csv]   # disable CSV when Kafka is the only consumer needed
+# Python backend
+pip install -r requirements.txt --break-system-packages
+
+# Dashboard frontend (Node 18+ required)
+cd dashboard/frontend
+npm install
+cd ../..
 ```
 
-**PCAP mode** (offline / synthetic data):
+### Step-by-step startup
+
 ```bash
-python collectors/netflow_collector.py \
-  --mode pcap \
-  --file captures/traffic.pcap
-```
-
-#### Output
-
-Daily-rotated files: `data/raw/netflow_raw_<YYYY-MM-DD>.csv`
-
-Files rotate at UTC midnight. The `_load_netflow()` function in
-`unified_preprocessing.py` accepts either a single file path or a
-directory, concatenating all `netflow_raw_*.csv` files it finds. Old
-daily files can be deleted independently (e.g. anything older than 90
-days for the rolling retrain window).
-
-#### NetFlow v9 multi-exporter safety
-
-NetFlow v9 exporters send *template FlowSets* that describe their field
-layouts before sending data. Different devices (routers from different
-vendors, or even different models from the same vendor) commonly reuse the
-same template ID numbers with completely different field layouts.
-
-The template cache in `packet_utils.py` is keyed by
-`(source_addr, template_id)` — the exporter's IP address plus the
-template ID — rather than template ID alone. Without this,
-`core-router-01`'s template 256 would silently overwrite
-`branch-router-01`'s template 256, and all of `branch-router-01`'s flows
-would be parsed with the wrong field layout, producing garbage data with
-no error raised.
-
-#### Kafka publishing
-
-When `--publish-kafka` is passed, each flow record is published to the
-Kafka topic as a JSON object matching `NetFlowRecord.to_csv_row()`. The
-`kafka-python` package is imported only when this flag is present, so
-training-only environments don't need it installed.
-
-### 6.2 PRTG Collector (`collectors/prtg_collector.py`)
-
-Queries PRTG's `historicdata.json` REST API per configured sensor and
-produces rows matching the exact schema `_load_snmp()` expects.
-
-#### Why PRTG instead of raw SNMP
-
-PRTG is already deployed on the monitored devices. Writing our own SNMP
-poller would duplicate PRTG's device discovery, OID mapping, credential
-management, and polling logic. Instead we consume PRTG's clean REST API
-output and translate it into the schema the preprocessing module expects.
-
-#### The schema contract
-
-This is the most important design constraint in the PRTG collector: its
-output **must** match these exact columns, or `BandwidthFeatures` and
-`DeviceBehaviorFeatures` will silently produce wrong results:
-
-```
-timestamp, device_ip, if_in_octets, if_out_octets, if_speed,
-if_in_errors, cpu_load_pct, mem_used_pct
-```
-
-`if_speed` is read from `config.yaml`'s `sensors.if_speed_bps` rather than
-from PRTG because PRTG's traffic sensor types don't expose nominal link
-speed reliably as a readable channel.
-
-#### Channel name matching
-
-PRTG sensor channel names vary by sensor type, PRTG version, and
-localization settings. The collector uses a candidate-list approach
-(`CHANNEL_CANDIDATES` dict in `prtg_collector.py`): for each metric, it
-tries a list of known channel name variations in order and takes the first
-match. The raw numeric value (`<channel_name>_raw`) is always preferred
-over the formatted string.
-
-To add support for a custom PRTG sensor name, add it to the appropriate
-list in `CHANNEL_CANDIDATES`.
-
-#### Modes
-
-**Poll mode** (live collection):
-```bash
+# 1. Start collectors (each in its own terminal / process)
+python collectors/netflow_collector.py --mode udp --port 2055
 python collectors/prtg_collector.py --mode poll
-```
 
-**Backfill mode** (historical pull):
-```bash
-# Pull the last 30 days of history in 24h chunks
-python collectors/prtg_collector.py --mode backfill --days 30
-```
-
-Backfill is useful when PRTG already has weeks of stored history. Rather
-than waiting through the 14-day real-time observation phase, you can
-backfill 14+ days immediately, then trigger training via
-`python orchestrator/orchestrator.py --force-train`.
-
----
-
-## 7. Preprocessing Pipeline
-
-### 7.1 The Unified Preprocessing Module (`preprocessing/unified_preprocessing.py`)
-
-This is the most critical module in the system. It defines what "features"
-the models see, and it guarantees that training and live inference see
-exactly the same features.
-
-#### Structure
-
-Each of the four detectors has its own class with two class methods:
-- `from_csv(netflow_csv, ...)` — loads CSVs, computes features for training
-- `from_stream(netflow_df, ...)` — takes in-memory DataFrames, for live inference
-
-The actual feature mathematics live in a private `_compute()` method that
-both `from_csv` and `from_stream` call. The only difference between the
-two paths is how data is loaded.
-
-```
-from_csv  ──► _load_netflow() ──► _compute() ──► feature DataFrame
-              _load_snmp()
-
-from_stream ──────────────────► _compute() ──► feature DataFrame
-              (pre-loaded DataFrames passed in)
-```
-
-#### The `_assign_device_ip()` problem
-
-When a flow arrives from external source `203.0.113.50` to internal
-destination `10.0.0.5`, naively setting `device_ip = src_ip` would
-attribute this traffic to the external attacker's IP — meaning the internal
-device `10.0.0.5` would never see the attack traffic in its behavioral
-profile.
-
-The shared helper `_assign_device_ip(df)` applies this rule:
-- If `dst_ip` is a private (RFC-1918) address → the flow is *inbound to*
-  an internal device → `device_ip = dst_ip`
-- Otherwise → the flow is *outbound from* an internal device →
-  `device_ip = src_ip`
-
-This function is shared by `BandwidthFeatures`, `DeviceBehaviorFeatures`,
-and `ProtocolFeatures`. `PortScanFeatures` uses `src_ip` explicitly because
-it profiles the scanning *source*, not the target.
-
-#### Z-score architecture
-
-Features like "current bandwidth vs. historical mean" require historical
-context. The training and inference paths handle this differently:
-
-**Training** (`from_csv`): `_rolling_zscore()` computes a rolling mean and
-standard deviation over 1440 windows (1 day) of in-CSV history, using
-`pandas.rolling()`. This works because the training CSV contains days or
-weeks of history for every device.
-
-**Live inference** (`from_stream`): A single 1-minute Kafka window has no
-history to roll over. Instead, `from_stream` accepts a
-`normalization_stats` dict (loaded from `normalization_stats.json`) and
-calls `_apply_stats_zscore()`, which looks up each device's pre-computed
-mean and std and applies `z = (value - mean) / std` per row.
-
-`normalization_stats.json` is written by the training scripts after every
-successful training run. It must be updated alongside the model files —
-`build_all_normalization_stats()` handles this.
-
-Without this separation, live z-scores would always be approximately 0
-(because there's only one row of "history" in a single Kafka batch), making
-the bandwidth spike detector's z-score features useless in production.
-
-#### Empty input safety
-
-All four `from_stream` methods handle empty input DataFrames (no flows
-for a particular window) without crashing. The root bug this guards
-against: `.apply(_is_private_ip)` on an empty Pandas Series returns
-`dtype=object` instead of `bool`, and boolean-indexing a DataFrame with an
-object-dtype empty Series silently drops all columns (a silent data
-corruption, not an error). The fix: `.astype(bool)` after every
-`.apply(_is_private_ip)` call.
-
-#### Feature sets
-
-**BandwidthFeatures** (keyed by `device_ip`, `window`):
-```
-bw_in_bytes, bw_out_bytes, bw_in_pkts, bw_out_pkts,
-bw_in_rate_bps, bw_out_rate_bps,
-bw_in_zscore, bw_out_zscore,       ← vs. device's historical baseline
-if_util_in, if_util_out,            ← from PRTG (octets / speed)
-if_errors_delta,                    ← from PRTG
-cpu_load_pct, mem_used_pct          ← from PRTG
-```
-
-**PortScanFeatures** (keyed by `src_ip`, `window`):
-```
-flows_total, flows_per_sec,
-distinct_dst_ports, distinct_dst_ips,
-port_entropy,                        ← low = sequential scan, high = random
-tcp_syn_ratio, udp_ratio,
-success_rate,                        ← flows with established flags / total
-small_flow_ratio,                    ← flows < 3s duration
-well_known_port_ratio                ← ports 1-1024
-```
-
-**DeviceBehaviorFeatures** (keyed by `device_ip`, `window`):
-```
-bytes_in, bytes_out,
-bytes_in_zscore, bytes_out_zscore,
-tcp_ratio, udp_ratio, icmp_ratio,
-distinct_dst_ips, distinct_dst_ips_zscore,
-hour_sin, hour_cos,                  ← cyclical time encoding
-cpu_util_zscore, mem_util_zscore     ← from PRTG
-```
-
-**ProtocolFeatures** (keyed by `device_ip`, `window`):
-```
-protocol_entropy,
-tcp_ratio, udp_ratio, icmp_ratio, other_ratio,
-num_new_protocols,                   ← protocols not in device's baseline
-port_protocol_mismatch_count,        ← e.g. TCP to port 53 (should be UDP)
-avg_pkt_size_tcp, avg_pkt_size_udp,
-kl_div_from_baseline                 ← KL divergence from device's historical
-                                       protocol distribution
-```
-
-### 7.2 Loading Raw Data
-
-`_load_netflow(path)` and `_load_snmp(path)` both accept either:
-- A single CSV file path, or
-- A directory, in which case all matching `netflow_raw_*.csv` or
-  `prtg_raw_*.csv` files are concatenated.
-
-This supports the daily-rotation convention the collectors use — the
-preprocessing module never needs to know which day's files to load; it
-just reads everything in the directory.
-
----
-
-## 8. Training Pipeline
-
-### 8.1 Overview
-
-Training scripts are intentionally simple, dependency-light processes:
-they read CSVs, compute features, fit a model, and write files. No Kafka,
-no live collectors, no orchestrator logic. This makes them easy to test
-in isolation and easy to debug when a retrain fails.
-
-The orchestrator triggers them as subprocesses, so a crash in a training
-script is cleanly isolated and the orchestrator can roll back the previous
-models without any corruption of the running inference pipeline.
-
-### 8.2 Model Bundle Format
-
-The most important artifact each script produces is a model bundle — a
-dict serialised by `joblib.dump()`:
-
-```python
-{
-  "model": <fitted sklearn estimator>,
-  "feature_columns": ["col_a", "col_b", ...],  # CRITICAL: exact column order
-  "model_type": "isolation_forest",
-  "trained_at": 1718000000.0,
-  "training_rows": 12450,
-  # any extra_meta passed to save_model()
-}
-```
-
-The `feature_columns` list is the train/inference contract. When
-`score_window()` calls `to_matrix(feat_df, bundle["feature_columns"])`,
-it builds the feature matrix in this exact column order. If a column is
-missing from the live feature DataFrame (e.g. no UDP flows this window →
-`avg_pkt_size_udp` is absent), `to_matrix()` fills it with 0, matching
-the `fillna(0)` convention used at the end of every `_compute()` call.
-
-If `unified_preprocessing.py` ever adds, removes, or renames a feature
-column, re-running `evaluate_models.py` will catch the mismatch:
-
-```
-FAIL: Model expects feature columns not present in current processed features:
-['old_feature_col']. This usually means unified_preprocessing.py changed
-its output columns since this model was trained.
-```
-
-### 8.3 Time-Aware Train/Eval Split
-
-`split_train_eval()` in `training/common.py` sorts by the `window` column
-and puts the last 20% of windows into the evaluation set, not a random
-sample. This is more realistic for time-series anomaly data: the evaluation
-set resembles "the immediate future after training," which is what live
-inference will face.
-
-A random split would allow the model to "see" future patterns during
-training (temporal leakage), producing overly optimistic evaluation scores.
-
-### 8.4 Isolation Forest Scoring Convention
-
-`score_isolation_forest()` in `training/common.py` transforms sklearn's
-`decision_function` output (which is positive for normal points, negative
-for anomalies) into an intuitive `[0, 1]` range where higher = more
-anomalous:
-
-```python
-scores = clip(0.5 - decision_function(X), 0, 1)
-```
-
-This means:
-- A normal point (decision_function ≈ 0) → anomaly score ≈ 0.5
-- A very anomalous point (decision_function ≈ -0.5) → anomaly score ≈ 1.0
-- A very "normal" point (decision_function ≈ +0.5) → anomaly score ≈ 0.0
-
-The severity thresholds (0.55, 0.65, 0.75, 0.85) are calibrated relative
-to this 0.5 "typical normal" baseline.
-
-### 8.5 Protocol Baseline Bootstrapping
-
-`train_protocol_model.py` handles a chicken-and-egg problem:
-`ProtocolFeatures` needs a per-device protocol baseline to compute
-`kl_div_from_baseline` and `num_new_protocols`, but this baseline itself
-comes from the training data.
-
-The bootstrap sequence:
-1. **First run**: `protocol_baseline.csv` doesn't exist. `_load_baseline()`
-   returns `{}` → KL divergence and `num_new_protocols` are 0 for every
-   row. The model trains on these zero-filled values. At the end of the run,
-   a fresh `protocol_baseline.csv` is written from the training data.
-2. **Subsequent runs**: `protocol_baseline.csv` exists and is loaded before
-   feature computation. KL divergence now reflects real protocol drift since
-   the last training run. The baseline is refreshed again at the end.
-
-This means the protocol detector is effectively "blind" to protocol drift
-on its very first training run, but fully functional on all subsequent ones.
-
-### 8.6 Per-Device Baselines
-
-`train_device_model.py --mode per-device --device-ip <ip>` trains a
-dedicated Isolation Forest on only that device's historical windows. The
-result is stored in `data/models/device_profiles/<ip>_model.pkl`.
-
-This implements the "on user request, create a normal baseline for a
-particular device" requirement. An admin triggers this from the dashboard
-(Device Detail page → "Train baseline for this device"), which calls
-`POST /devices/<ip>/baseline`, which calls
-`SystemOrchestrator.train_device_baseline(ip)`.
-
-Per-device models are **additive and isolated** — they do not go through
-the archive/evaluate/promote pipeline used for the four global models. A
-bad per-device profile cannot roll back or break the global models.
-
-### 8.7 Evaluation Gate (`evaluate_models.py`)
-
-The evaluation gate is the orchestrator's final check before promoting
-new models. It fails (exits 1) if any of:
-
-- A model file doesn't exist or can't be loaded
-- A model's `feature_columns` includes columns not present in the current
-  processed features (catches preprocessing drift)
-- Evaluation-split anomaly scores are all identical (degenerate model)
-- Evaluation scores contain NaN
-- Evaluation scores fall outside `[0, 1]`
-- For Random Forest models with labels: accuracy below 0.6
-
-On failure, the orchestrator rolls back to the previously archived models.
-The system either stays in INFERENCE (serving the old models) or returns to
-OBSERVATION (if this was the first-ever training attempt).
-
----
-
-## 9. Orchestrator & Lifecycle
-
-### 9.1 Phase State Machine
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  OBSERVATION                                                │
-│  - Collectors write to data/raw/                           │
-│  - No detection runs                                        │
-│  - tick() checks thresholds every interval                  │
-│                                                             │
-│  → Exits when:                                              │
-│     min_collection_days elapsed AND                         │
-│     netflow record count ≥ min_netflow_records             │
-│                                                             │
-└────────────────────────────┬────────────────────────────────┘
-                             │ thresholds met
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  TRAINING  (transient, typically seconds to minutes)        │
-│  1. Archive current models → data/models/archive/<ts>/     │
-│  2. Run train_bandwidth_model.py                           │
-│  3. Run train_portscan_model.py                            │
-│  4. Run train_device_model.py                              │
-│  5. Run train_protocol_model.py                            │
-│  6. Run evaluate_models.py                                 │
-│                                                             │
-│  → Pass: promote, transition to INFERENCE                   │
-│  → Fail: rollback archived models                          │
-│          if models_version > 0 → stay in INFERENCE          │
-│          if models_version == 0 → return to OBSERVATION     │
-│                                                             │
-└────────────────────────────┬────────────────────────────────┘
-                             │ eval passed
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  INFERENCE                                                  │
-│  - Live detection running (stream_router.py)               │
-│  - tick() checks retrain_interval_days each interval       │
-│  - Models hot-reload when models_version changes           │
-│                                                             │
-│  → Exits to TRAINING when:                                  │
-│     (now - last_retrain_at) ≥ retrain_interval_days × 86400│
-│     OR admin calls POST /system/retrain                    │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 9.2 System State
-
-`orchestrator/system_state.py` wraps a single JSON file
-(`data/models/system_state.json`) with atomic writes (write to `.tmp`,
-then `rename()` — POSIX-atomic):
-
-```json
-{
-  "phase": "inference",
-  "observation_started_at": 1718000000.0,
-  "last_training_started_at": 1719209200.0,
-  "last_training_completed_at": 1719209845.0,
-  "last_training_result": "passed",
-  "last_retrain_at": 1719209845.0,
-  "models_version": 2,
-  "notes": "Training completed and promoted (snapshot: 2024-06-24T02-10-45Z)."
-}
-```
-
-This file is read by:
-- `orchestrator.py` (writes and reads it)
-- `stream_router.py` (reads `models_version` to detect when to hot-reload)
-- `api/routes_system.py` (reads it to serve the `/system/status` endpoint)
-- `dashboard/frontend` (consumes `/system/status` to render the phase banner)
-
-### 9.3 Archive and Rollback
-
-Before every training run, `_archive_current_models()` copies:
-```
-data/models/bandwidth_model.pkl
-data/models/portscan_model.pkl
-data/models/device_model.pkl
-data/models/protocol_model.pkl
-data/models/normalization_stats.json
-data/models/device_profiles/  (directory copy)
-```
-to `data/models/archive/<YYYY-MM-DDTHH-MM-SSZ>/`.
-
-If `evaluate_models.py` exits non-zero, `_rollback()` copies these files
-back over whatever the training scripts just produced. This is the complete
-rollback — the inference pipeline will automatically use the restored files
-on its next `models_version` check.
-
-Archives are pruned to the most recent 10 snapshots (configurable via
-`ARCHIVE_RETENTION` in `orchestrator.py`).
-
-### 9.4 Running the Orchestrator
-
-**One-off tick** (for cron/systemd timers):
-```bash
-python orchestrator/orchestrator.py
-```
-
-**Forced training** (ignores thresholds):
-```bash
-python orchestrator/orchestrator.py --force-train
-```
-
-**Per-device baseline** (runs in-process, no subprocess):
-```bash
-python orchestrator/orchestrator.py --device-baseline 10.0.0.5
-```
-
-**Continuous scheduler** (checks every N minutes):
-```bash
+# 2. Start the orchestrator scheduler
+#    (manages observation -> training -> inference automatically)
 python orchestrator/scheduler.py --interval-minutes 60 --run-immediately
+
+# 3. Start the API
+uvicorn api.main:app --port 8000
+
+# 4. Start the dashboard (development server with hot reload)
+cd dashboard/frontend && npm run dev
+# Open http://localhost:5173
 ```
 
-The scheduler uses APScheduler's `BlockingScheduler` with `max_instances=1`
-so if a training run is still executing when the next tick fires, the tick
-is skipped rather than starting a second concurrent training run.
-
----
-
-## 10. Live Inference
-
-### 10.1 Sliding Window Buffer (`ingestion/sliding_window.py`)
-
-`SlidingWindowBuffer` implements a watermark-style window buffer:
-
-- Records are added with `add(record)`, where `record` must have a numeric
-  `timestamp` key (the flow's own timestamp, not arrival time).
-- Records are bucketed by `floor(timestamp / window_sec) * window_sec`.
-- A window is "ready" (returned by `flush_ready()`) when either:
-  - A record from a strictly *later* window has arrived (we know no more
-    records for this window will come from the same timeline), or
-  - `grace_period_sec` seconds have elapsed since the last new-maximum-window
-    was seen (handles quiet periods where traffic stops and no "later"
-    record ever arrives).
-
-This is standard stream-processing watermark logic. The grace period
-(default 10s) bounds the worst-case latency for the final window of a
-session, preventing it from staying in the buffer indefinitely.
-
-### 10.2 Stream Router (`ingestion/stream_router.py`)
-
-`StreamRouter` holds one `SlidingWindowBuffer` for NetFlow records and one
-for PRTG records. It processes one window at a time:
-
-```python
-def process_one_window(self, window, netflow_records, snmp_records):
-    self._maybe_reload_models()        # check models_version
-    netflow_df = _records_to_df(netflow_records, NETFLOW_COLUMNS)
-    snmp_df = _records_to_df(snmp_records, PRTG_COLUMNS)
-    scores_df = score_window(netflow_df, snmp_df, self.models)
-    self.alert_engine.process_window(scores_df)
-```
-
-`tick()` calls `flush_ready()` on both buffers and processes every window
-that has complete data from at least one stream. If a window has NetFlow
-but no PRTG data (e.g. the PRTG poller was briefly down), it still
-processes — `from_stream()` handles empty `snmp_df` gracefully by filling
-PRTG-derived features with 0/NaN.
-
-### 10.3 Model Hot-Reload
-
-`_maybe_reload_models()` is called before every window processing. It reads
-`system_state.json`'s `models_version` field and compares it to the last
-seen version. If it has changed (the orchestrator just promoted a new
-training run), `ModelBundle.reload()` is called to load the new `.pkl`
-files from disk.
-
-This means `stream_router.py` does not need to be restarted after a
-retrain. The new models are picked up automatically within one window
-(60 seconds) of the orchestrator completing promotion.
-
-### 10.4 Starting the Live Inference Loop
+After the observation phase completes and training passes, the orchestrator
+automatically transitions to inference. Collectors can be restarted with
+`--publish-kafka` to also feed the live stream router:
 
 ```bash
-# Prerequisites: kafka-python installed, Kafka broker running
-pip install kafka-python --break-system-packages
-
-# Collectors must be running with --publish-kafka
+# Phase 3 — live inference (requires kafka-python + a running Kafka broker)
 python collectors/netflow_collector.py --mode udp --publish-kafka
-python collectors/prtg_collector.py --mode poll
-
-# Then start the stream router
+python collectors/prtg_collector.py --mode poll      # PRTG already publishes via its own loop
 python ingestion/stream_router.py
 ```
 
----
+### Quick demo without real hardware
 
-## 11. Alerting System
+Drop the provided synthetic data into `data/raw/`, then force-train and
+start the API + dashboard:
 
-### 11.1 Risk Scoring (`alerts/risk_scoring.py`)
-
-All functions in this module are pure (no I/O, no state).
-
-**`score_to_severity(score)`** maps `[0, 1]` to severity:
-
-| Score range | Severity |
-|---|---|
-| ≥ 0.85 | critical |
-| ≥ 0.75 | high |
-| ≥ 0.65 | medium |
-| ≥ 0.55 | low |
-| < 0.55 | info |
-| NaN / None | info |
-
-**`classify_issue_type(detector, feature_row)`**:
-
-| Detector | Default issue type | Refinement |
-|---|---|---|
-| `bandwidth` | `network_congestion` | → `device_capacity` if `max(if_util_in, if_util_out) ≥ 0.85` |
-| `portscan` | `connectivity_security` | — |
-| `device_behavior` | `device_environment` | — |
-| `protocol` | `network_performance` | — |
-
-The bandwidth congestion/capacity distinction is important operationally:
-"congestion" (spike above baseline but link not saturated) suggests a
-traffic burst or DDoS; "capacity" (link utilisation ≥ 85%) suggests a
-provisioning problem.
-
-**`compute_health_score(detector_scores)`** produces a 0-100 score:
+```bash
+cp data/test_fixtures/netflow_raw_2026-06-13.csv data/raw/
+cp data/test_fixtures/prtg_raw_2026-06-13.csv data/raw/
+python orchestrator/orchestrator.py --force-train
+uvicorn api.main:app --port 8000
+cd dashboard/frontend && npm run dev
 ```
-weighted_anomaly = Σ(score_i × weight_i) / Σ(weight_i)
-
-health = 100 × (1 - (weighted_anomaly - 0.5) / 0.5)  clamped to [0, 100]
-```
-Weights: `device_behavior=0.3`, `protocol=0.3`, `bandwidth=0.2`,
-`portscan=0.2`. Device behavior and protocol anomalies are weighted more
-heavily because they typically indicate compromise or misconfiguration,
-which is more serious than a transient traffic spike. NaN scores are
-excluded from the weighted average (their weight is redistributed
-proportionally).
-
-### 11.2 Alert Store (`alerts/alert_store.py`)
-
-Alerts are stored as JSON files, one per UTC day:
-`data/alerts/alerts_<YYYY-MM-DD>.json`. Each file is an array of alert
-objects. Updates are written atomically (write `.tmp`, then `rename()`).
-
-An open alert from day N that is still open on day N+3 stays in the file
-for day N — it's looked up by scanning the most recent
-`_RECENT_DAYS_TO_SCAN = 14` days' files. This bounds the scan window to a
-reasonable length (an alert shouldn't stay open for more than 14 days in
-practice) while keeping each day's file independent.
-
-### 11.3 Alert Engine (`alerts/alert_engine.py`)
-
-`process_window(scores_df)` implements the dedup logic:
-
-```
-For each row in scores_df:
-  if score is NaN → skip (no opinion)
-  severity = score_to_severity(score)
-  existing = store.find_open_alert(detector, entity_id)
-
-  if severity < MIN_ALERTABLE_SEVERITY ("low"):
-    if existing → close it
-    continue
-
-  if existing:
-    store.update_alert(existing, window, score, severity)
-    # severity can escalate (new severity > current) but never de-escalate
-    # while open — de-escalation means the alert should be closed, not
-    # downgraded
-  else:
-    store.create_alert(detector, entity_id, issue_type, severity, ...)
-```
-
-`process_window()` returns all touched alerts (both opened/updated and
-closed) so the stream router can log them, and in the future, a
-notification system could be triggered on the return value.
 
 ---
 
-## 12. Topology & Health
+## 12b. Dashboard (`dashboard/frontend/`)
 
-### 12.1 Topology Builder (`topology/topology_builder.py`)
+The dashboard is a React 18 + Vite 5 single-page application that consumes
+the FastAPI backend. In development the Vite dev server proxies `/api/*`
+to `http://127.0.0.1:8000`, so no CORS configuration is needed.
 
-`TopologyBuilder` reads `config.yaml`'s device list, the current
-`health_scores.json`, and the open alerts from `AlertStore`, and assembles
-views without any additional I/O or computation.
+### Development
 
-`building_view()` groups devices by their `building` field. For each
-building it computes:
-- `device_count`
-- `open_issue_count` (sum across all devices in the building)
-- `max_severity` (worst alert severity across any device in the building)
-- `avg_health_score` (mean of all devices with a health score; null if none)
-- `devices` (full device nodes for the building)
-
-Devices with no `building` set are grouped under `"Unassigned"`.
-
-`device_detail(ip)` adds two fields to the device node not present in the
-list view: `open_alerts` (the full alert objects, for the detail panel) and
-`has_per_device_profile` (whether
-`data/models/device_profiles/<ip>_model.pkl` exists).
-
----
-
-## 13. REST API Reference
-
-The API is a FastAPI application (`api/main.py`) with five routers mounted
-at `/system`, `/devices`, `/alerts`, `/topology`, `/traffic`.
-
-Interactive documentation (Swagger UI) is available at
-`http://localhost:8000/docs` when the server is running.
-
-All endpoints degrade gracefully during the observation phase: empty
-collections, `null` scores, and `"unknown"` device status are returned
-rather than errors.
-
-### Authentication
-
-The API has no authentication built in. In production, place it behind an
-nginx/Caddy reverse proxy or VPN — it is not designed to be exposed
-directly to the public internet.
-
-### Endpoints
-
-#### System
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/system/status` | Current phase, observation progress, training result, model version |
-| POST | `/system/retrain` | Manually trigger the training pipeline. Returns 409 if training is already in progress. Blocks until complete. |
-
-**GET `/system/status` response**:
-```json
-{
-  "phase": "inference",
-  "notes": "Training completed and promoted (snapshot: 2024-06-24T02-10-45Z).",
-  "models_version": 3,
-  "last_retrain_at": 1719209845.0,
-  "last_training_result": "passed",
-  "observation": {
-    "ready": false,
-    "days_elapsed": 3.5,
-    "days_required": 14,
-    "netflow_records": 42150,
-    "records_required": 100000
-  }
-}
+```bash
+cd dashboard/frontend
+npm install
+npm run dev          # http://localhost:5173
 ```
 
-#### Devices
+Requires the FastAPI backend to be running on port 8000 at the same time.
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/devices/{ip}` | Device health, open alerts, per-device profile flag. 404 if not in config.yaml. |
-| POST | `/devices/{ip}/baseline` | Train a per-device behavioral baseline. Blocks until complete (~seconds). Returns updated device detail. |
-| DELETE | `/devices/{ip}/baseline` | Remove a per-device baseline. Returns 404 if no baseline exists. |
+### Production build
 
-#### Alerts
+```bash
+cd dashboard/frontend
+npm run build        # outputs to dashboard/frontend/dist/
+```
 
-| Method | Path | Query params | Description |
-|---|---|---|---|
-| GET | `/alerts/open` | — | All currently-open alerts |
-| GET | `/alerts` | `since`, `until`, `last_hours`, `device_ip`, `building`, `severity`, `status` | Historical query with filters. `last_hours` is a convenience shortcut for `since = now - last_hours * 3600`. |
-| GET | `/alerts/distribution` | `since`, `until`, `last_hours=24` | Per-entity issue distribution: count, max severity, issue types. |
-| GET | `/alerts/health-scores` | — | Current per-device 0-100 health scores |
+Serve `dist/` with any static file server. Because it is an SPA, all
+non-asset requests must fall back to `dist/index.html`. The `/api/*`
+prefix must be proxied to the FastAPI backend.
 
-**GET `/alerts/distribution` response**:
-```json
-{
-  "since": 1719123600.0,
-  "until": null,
-  "distribution": [
-    {
-      "entity_id": "10.0.0.5",
-      "building": "HQ",
-      "device_name": "core-router-01",
-      "issue_count": 4,
-      "max_severity": "high",
-      "issue_types": ["device_environment", "network_congestion"]
+**Nginx example**:
+```nginx
+server {
+    listen 80;
+
+    # Proxy API requests to FastAPI
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
     }
-  ]
+
+    # Serve the React SPA
+    location / {
+        root /path/to/dashboard/frontend/dist;
+        try_files $uri $uri/ /index.html;
+    }
 }
 ```
 
-#### Topology
+**Caddy example** (`Caddyfile`):
+```
+:80 {
+    handle /api/* {
+        uri strip_prefix /api
+        reverse_proxy 127.0.0.1:8000
+    }
+    handle {
+        root * /path/to/dashboard/frontend/dist
+        try_files {path} /index.html
+        file_server
+    }
+}
+```
 
-| Method | Path | Description |
+### Pages
+
+| Page | Route | What it shows |
 |---|---|---|
-| GET | `/topology/buildings` | Building-grouped device health. One entry per building with device list, issue counts, avg health. |
-| GET | `/topology/devices` | Flat list of all configured devices with current health/status. |
+| **Overview** | `/` | Building-grouped health cards · open alert summary · system phase banner |
+| **Devices** | `/devices` | Sortable/filterable table — status, name/IP, building, health score, open issues, model type |
+| **Device Detail** | `/devices/:ip` | Health score · per-detector anomaly scores · PulseStrip · open alerts · per-device baseline controls |
+| **Alerts** | `/alerts` | Issue distribution cards · filterable alert history (status / severity / detector / time window) |
+| **Traffic** | `/traffic` | Per-device bandwidth area charts · latest live anomaly scores |
 
-#### Traffic
+### System status banner
 
-| Method | Path | Query params | Description |
-|---|---|---|---|
-| GET | `/traffic/recent` | `minutes=15` (1-1440) | Per-device per-minute bandwidth aggregates. Returns `{window_sec: 60, devices: {ip: [{window, bytes_in, bytes_out, packets_in, packets_out}]}}`. |
-| GET | `/traffic/live-scores` | `minutes=1` (1-10) | Ensemble detector scores on the most recent N minutes of data. Does NOT persist alerts. NaN scores serialised as `null`. |
+A persistent banner at the top of every page shows the current lifecycle
+phase, the orchestrator's last status note, and a **Retrain now** button.
+During observation it also shows a progress bar (time elapsed + record
+count toward the configured thresholds).
+
+| Phase | Banner appearance |
+|---|---|
+| `observation` | Amber pill · progress bar · note e.g. "Collecting baseline data — day 3 of 14" |
+| `training` | Blue pill · "Training pipeline running." · button disabled |
+| `inference` | Green pill · model version number · Retrain button active |
+
+### Per-device baseline (Device Detail page)
+
+When an admin navigates to a device and clicks **Train baseline for this
+device**, the dashboard calls `POST /devices/{ip}/baseline`, which triggers
+`train_device_model.py --mode per-device` in the background. The device's
+anomaly scoring then uses this personalised model instead of the global one.
+The button changes to **Remove baseline** to revert. Both actions complete
+synchronously (the API blocks until the subprocess finishes, typically a
+few seconds).
+
+### PulseStrip — the signature element
+
+Every device row and the Device Detail page show a **PulseStrip**: a
+horizontal strip of small vertical ticks, one per recent health-score
+sample, read left (oldest) → right (latest). Tick height and color encode
+the severity band of that score:
+
+| Color | Health range | Meaning |
+|---|---|---|
+| Green `#4ADE80` | 90–100 | Healthy |
+| Teal `#3FA796` | 78–89 | Low anomaly |
+| Amber `#D9A33E` | 65–77 | Medium anomaly |
+| Orange `#E0763C` | 50–64 | High anomaly |
+| Red `#E05C5C` | < 50 | Critical anomaly |
+| Grey | — | No data yet |
+
+### Polling intervals
+
+All pages poll the API automatically; nothing requires a manual refresh.
+
+| Data | Interval |
+|---|---|
+| System status (banner) | 10 s |
+| Buildings / open alerts | 15 s |
+| Device list | 20 s |
+| Device detail / per-device alerts | 15 s |
+| Traffic charts | 15 s |
+| Live anomaly scores | 30 s |
+
+### Design tokens
+
+```
+Background:  #0B0E14  (near-black, blue cast — NOC monitor feel)
+Panel:       #13171F
+Border:      #22272F
+Text:        #E6E9EF
+Text dim:    #8B92A3
+Accent:      #4ADE80  (healthy green)
+
+Severity:    info=#5B7A99  low=#3FA796  medium=#D9A33E  high=#E0763C  critical=#E05C5C
+
+Display font:  IBM Plex Mono  (tabular numerals, data values, IPs)
+Body font:     Inter          (UI labels, descriptions)
+```
 
 ---
 
-## 14. Dashboard Frontend
+## 13. Testing
 
-### 14.1 Technology
+184 tests across the project:
 
-| Layer | Choice | Rationale |
-|---|---|---|
-| Framework | React 18 | Component model suits a live-updating dashboard; hooks make polling clean |
-| Build tool | Vite 5 | Fast HMR in dev; no config needed for SPA routing in prod |
-| Routing | React Router 6 | Client-side navigation between pages |
-| Charts | Recharts | Thin wrapper over D3 that works well with React's render model |
-| Fonts | IBM Plex Mono + Inter | Mono for all numeric/data values (tabular numerals align in columns); Inter for prose/labels |
-| No CSS framework | Intentional | Design token variables in `index.css` give precise control without fighting a utility framework |
-
-### 14.2 Design System
-
-All visual tokens are CSS custom properties in `src/index.css`:
-
-```
-Background:     --bg:        #0B0E14  (near-black, blue cast)
-Panel surface:  --panel:     #13171F
-Hover surface:  --panel-alt: #181D27
-Border:         --border:    #22272F
-Primary text:   --text:      #E6E9EF
-Secondary text: --text-dim:  #8B92A3
-Healthy accent: --accent:    #4ADE80
-
-Severity:
-  --sev-info:     #5B7A99  (slate blue)
-  --sev-low:      #3FA796  (teal)
-  --sev-medium:   #D9A33E  (amber)
-  --sev-high:     #E0763C  (orange)
-  --sev-critical: #E05C5C  (red)
+```bash
+pip install -r requirements.txt --break-system-packages
+python -m pytest tests/ -v
 ```
 
-The five severity colors exactly match the API's severity scale, so a
-backend alert's `severity: "high"` maps directly to `var(--sev-high)`
-everywhere in the UI without any translation table.
-
-### 14.3 Data Fetching
-
-`src/hooks/usePolling.js` provides a `usePolling(fetcher, intervalMs)` hook
-that:
-- Calls `fetcher()` immediately on mount
-- Re-calls it every `intervalMs`
-- Returns `{ data, error, loading, refresh }` where `refresh()` is for
-  on-demand re-fetches (e.g. after triggering a retrain)
-- Errors do NOT clear previously-loaded `data` — a transient API hiccup
-  shows `error` alongside the last-known-good data, rather than blanking
-  the dashboard
-
-### 14.4 The PulseStrip Component
-
-`PulseStrip` is the dashboard's signature visual element: a horizontal row
-of small vertical ticks, one per health-score sample, colored by severity:
-
-```jsx
-<PulseStrip samples={[95, 91, 88, 72, 65, 41, 38, 91, 94, 96]} width={40} />
-```
-
-Tick height encodes magnitude (healthy = tall, critical = short) and tick
-color encodes the severity band. Reading left to right, it looks like a
-patient-monitor heartbeat strip, directly embodying the "network health
-vital signs" concept.
-
-`healthToSeverityClass(score)` in `src/utils/format.js` maps health scores
-to severity class names:
-```
-90-100 → sev-healthy  (#4ADE80)
-78-89  → sev-low      (#3FA796)
-65-77  → sev-medium   (#D9A33E)
-50-64  → sev-high     (#E0763C)
-< 50   → sev-critical (#E05C5C)
-null   → sev-unknown  (#22272F)
-```
-
-### 14.5 API Proxy Configuration
-
-`vite.config.js` proxies `/api/*` to `http://127.0.0.1:8000` and strips
-the `/api` prefix, so `fetch('/api/system/status')` in the frontend reaches
-`http://127.0.0.1:8000/system/status` on the backend. This means CORS is
-never needed in development.
-
-In production, configure the reverse proxy to do the same prefix-strip (see
-the nginx/Caddy examples in README.md section 12b).
+| File | Covers |
+|---|---|
+| `test_preprocessing.py` | Feature computation, `_assign_device_ip`, empty-input handling, z-score paths |
+| `test_collectors.py` | NetFlow v9 multi-exporter template isolation, CSV rotation |
+| `test_prtg_collector.py` | PRTG channel parsing, schema contract with `_load_snmp` |
+| `test_training.py` | Model save/load contract, feature column selection, evaluation gating |
+| `test_orchestrator.py` | Full lifecycle integration: observation→training→inference, rollback, per-device baselines, archive pruning (slow — runs real training subprocesses) |
+| `test_ensemble_detector.py` | Live scoring, per-device profile overrides, graceful no-model degradation |
+| `test_alerts.py` | Severity/issue classification, health scores, alert dedup/close lifecycle |
+| `test_stream_router.py` | Sliding window buffering, end-to-end window processing, model hot-reload |
+| `test_api.py` | All REST endpoints against a full trained-model fixture |
 
 ---
+
+## 14. Known Tuning Points / Future Work
+
+- **Severity thresholds** (`alerts/risk_scoring.py: SEVERITY_THRESHOLDS`)
+  are conservative defaults (0.55-0.85); real alert volume should inform
+  tuning — synthetic test data showed quite a bit of `low`-severity churn
+  near the 0.5 "typical" boundary.
+- **Syslog ingestion** for authentication-failure detection and fault
+  detection was planned but not yet implemented — would add a third
+  collector (`syslog_listener.py`) and a fifth issue-type category
+  (`authentication_failure`).
+- **Topology graph edges** (device-to-device links) are not inferred —
+  `topology_builder.py` currently returns devices grouped by building as a
+  flat list, not a connected graph. Would require LLDP/CDP or routing-table
+  discovery.
+- **Random Forest for port scan**: supported but unused until labelled data
+  (e.g. CICIDS2017/UNSW-NB15, or synthetic scans via Scapy) is supplied via
+  `train_portscan_model.py --labelled-csv`.
+
+---
+
+## Mininet School Simulation: SNMP-backed PRTG Emulation
+
+This project now includes a simulation mode for the final-year-project story where the school uses PRTG.
+In a real deployment, `collectors/prtg_collector.py` polls the PRTG REST API. In the Mininet lab, there is
+usually no PRTG server, so `collectors/snmp_prtg_collector.py` polls SNMP counters from simulated routers and
+servers, computes interval deltas, and writes the same PRTG-style files:
+
+```text
+ data/raw/prtg_raw_<YYYY-MM-DD>.csv
+```
+
+The output schema is unchanged:
+
+```csv
+timestamp,device_ip,if_in_octets,if_out_octets,if_speed,if_in_errors,cpu_load_pct,mem_used_pct
+```
+
+### Recommended lab layout
+
+```text
+Host OS
+  - FastAPI backend / dashboard
+  - NetFlow UDP collector on 0.0.0.0:2055
+  - data/raw shared with Mininet VM, or copied from the VM after collection
+
+Mininet VM
+  - Linux routers and OVS switches
+  - snmpd running inside monitored router/server namespaces
+  - SNMP-backed PRTG emulation collector
+  - OVS switches exporting NetFlow to the host-only adapter IP
+```
+
+### Run the Mininet topology
+
+Install Mininet-side packages first:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y snmp snmpd iperf nmap curl
+```
+
+Start the topology from the project root inside the Mininet VM. Replace `192.168.56.1` with the host-only IP
+of the machine running your anomaly system:
+
+```bash
+sudo python3 simulation/mininet_school_topology.py \
+  --netflow-target 192.168.56.1:2055 \
+  --config-out simulation/mininet_config.generated.yaml
+```
+
+The script creates a routed school network, configures OVS NetFlow export, starts `snmpd` in the monitored
+namespaces, starts simple HTTP/iperf demo services, and writes `simulation/mininet_config.generated.yaml` with
+the correct SNMP management IPs and interface indexes.
+
+### Run the SNMP-backed PRTG collector
+
+In a second terminal inside the Mininet VM:
+
+```bash
+python3 collectors/snmp_prtg_collector.py \
+  --mode poll \
+  --config simulation/mininet_config.generated.yaml \
+  --backend cli
+```
+
+The first poll initializes counter baselines. Rows are normally written from the second poll onward.
+For a quick smoke test that writes zero-delta first rows:
+
+```bash
+python3 collectors/snmp_prtg_collector.py \
+  --mode once \
+  --config simulation/mininet_config.generated.yaml \
+  --backend cli \
+  --emit-first-sample
+```
+
+### Run the NetFlow collector on the host OS
+
+```bash
+python collectors/netflow_collector.py --mode udp --host 0.0.0.0 --port 2055
+```
+
+### Demo traffic inside the Mininet CLI
+
+Normal baseline traffic:
+
+```bash
+finance-pc ping -c 10 10.0.3.10
+staff-pc curl http://10.0.3.10/
+branch-pc ping -c 10 10.0.1.11
+```
+
+Controlled lab anomalies:
+
+```bash
+# bandwidth spike inside the lab
+finance-pc iperf -c 10.0.3.10 -t 60
+
+# limited internal port-scan simulation against the demo web server
+staff-pc nmap -p 1-200 10.0.3.10
+
+# protocol/port misuse signal: UDP traffic on DNS-like port to the web server
+finance-pc iperf -u -c 10.0.3.10 -p 53 -b 5M -t 30
+```
+
+Keep these commands inside the Mininet lab only. They are designed to generate labelled demonstration traffic
+without touching any real external systems.
+
+
+## Production Security Setup
+
+The dashboard API includes the realistic minimum security controls for a LAN deployment:
+
+- Login authentication using bearer tokens
+- Admin-only access for retraining and device-baseline changes
+- Optional LAN/IP allow-list middleware
+- Strict CORS origin configuration
+- Security-sensitive audit logging
+- Secrets loaded from environment variables instead of hardcoded source values
+
+Before running the secured API for the first time, create a JWT secret and bootstrap administrator:
+
+```bash
+$env:NETSCOPE_JWT_SECRET="change-this-to-a-long-random-secret"
+$env:NETSCOPE_BOOTSTRAP_USERNAME="admin"
+$env:NETSCOPE_BOOTSTRAP_PASSWORD="change-this-admin-password"
+```
+
+Then start the backend:
+
+```bash
+uvicorn api.main:app --host 0.0.0.0 --port 8000
+```
+
+For a production LAN deployment, set the allowed dashboard origin and optionally enforce the LAN allow-list:
+
+```bash
+export NETSCOPE_CORS_ORIGINS="https://netscope.school.local"
+export NETSCOPE_ENFORCE_IP_ALLOWLIST="true"
+export NETSCOPE_IP_ALLOWLIST="127.0.0.1/32,192.168.0.0/16,10.0.0.0/8"
+```
+
+Audit events are written to `data/audit/audit.log`. User records are stored in `data/security/users.json` with PBKDF2 password hashes.
+
+Use HTTPS through a reverse proxy such as Nginx or Caddy. If TLS is terminated before FastAPI, keep the API bound to localhost or a protected management interface.

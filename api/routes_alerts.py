@@ -1,3 +1,9 @@
+"""
+Alert queries (open alerts, historical queries with filters), issue
+distribution view (must_add_to_project.txt item 5), and per-device health
+scores (item 3).
+"""
+
 import sys
 import time
 from pathlib import Path
@@ -18,7 +24,7 @@ def _get_engine() -> AlertEngine:
 
 @router.get("/open")
 def list_open_alerts():
-
+    """All currently-OPEN alerts, most relevant for a 'current issues' dashboard panel."""
     engine = _get_engine()
     return {"alerts": engine.store.list_open_alerts()}
 
@@ -33,7 +39,10 @@ def list_alerts(
     status: Optional[str] = Query(None, description="open|closed"),
     last_hours: Optional[float] = Query(None, description="Shortcut: alerts from the last N hours"),
 ):
-
+    """
+    Historical alert query with filters. `last_hours` is a convenience that
+    sets `since` to now - last_hours; if both are given, `since` wins.
+    """
     if since is None and last_hours is not None:
         since = time.time() - last_hours * 3600
 
@@ -52,8 +61,13 @@ def issue_distribution(
     last_hours: Optional[float] = Query(24, description="Default: last 24 hours"),
 ):
     """
-    must_add_to_project.txt number 5: "Issue distribution view allows
-    administrators to view the number of issues on different devices
+    must_add_to_project.txt item 5: "Issue distribution view allows
+    administrators to view the number of issues on different devices...
+    This helps administrators quickly focus on the affected devices and the
+    time range when many issues occur."
+
+    Returns one summary per affected entity (device or scanner IP) with
+    issue_count, max_severity, and the set of issue_types seen.
     """
     if since is None:
         since = time.time() - last_hours * 3600
@@ -70,7 +84,7 @@ def issue_distribution(
 @router.get("/health-scores")
 def health_scores():
     """
-    Current per-device health scores (must_add_to_project.txt number 3),
+    Current per-device health scores (must_add_to_project.txt item 3),
     last computed by AlertEngine on the most recent processed window.
     """
     engine = _get_engine()

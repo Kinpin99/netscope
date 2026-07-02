@@ -1,2 +1,23 @@
+# Python
 .idea/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node/Vite
+dashboard/frontend/node_modules/
+dashboard/frontend/.vite/
+
+# Runtime data
+/data/raw/*.csv
+/data/raw/*.json
+/data/processed/*.csv
+/data/models/*.pkl
+/data/models/*.json
+/data/models/archive/*
+!/data/**/.gitkeep
+
+# Generated simulation config
+simulation/mininet_config.generated.yaml
