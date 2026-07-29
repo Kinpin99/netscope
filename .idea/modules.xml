@@ -3,6 +3,7 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/network-anomaly-detection.iml" filepath="$PROJECT_DIR$/.idea/network-anomaly-detection.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../network-anomaly-detection-performance-alerts-update-V6.0.0/.idea/network-anomaly-detection-performance-alerts-update-V6.0.0.iml" filepath="$PROJECT_DIR$/../network-anomaly-detection-performance-alerts-update-V6.0.0/.idea/network-anomaly-detection-performance-alerts-update-V6.0.0.iml" />
     </modules>
   </component>
 </project>

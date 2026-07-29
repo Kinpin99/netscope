@@ -10,6 +10,10 @@ import Devices from './pages/Devices'
 import DeviceDetail from './pages/DeviceDetail'
 import Alerts from './pages/Alerts'
 import Traffic from './pages/Traffic'
+import Onboarding from './pages/Onboarding'
+import AccessPoints from './pages/AccessPoints'
+import Troubleshooting from './pages/Troubleshooting'
+import Settings from './pages/Settings'
 
 function ProtectedRoutes() {
   const { user, loading } = useAuth()
@@ -34,7 +38,10 @@ function ProtectedRoutes() {
             <Route path="/devices/:ip" element={<DeviceDetail />} />
             <Route path="/alerts" element={<Alerts />} />
             <Route path="/traffic" element={<Traffic />} />
-            <Route path="/settings" element={<SettingsPlaceholder />} />
+            <Route path="/access-points" element={<AccessPoints />} />
+            <Route path="/onboarding" element={<Onboarding />} />
+            <Route path="/troubleshooting" element={<Troubleshooting />} />
+            <Route path="/settings" element={<Settings />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </Shell>
@@ -61,14 +68,5 @@ export default function App() {
         </Routes>
       </AuthProvider>
     </BrowserRouter>
-  )
-}
-
-function SettingsPlaceholder() {
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '60px 20px', color: 'var(--text-dim)' }}>
-      <span style={{ fontSize: 13 }}>System settings</span>
-      <span style={{ fontSize: 11, marginTop: 4 }}>Configuration options will appear here.</span>
-    </div>
   )
 }

@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, Monitor, AlertTriangle, Activity, Settings, LogOut } from 'lucide-react'
+import { LayoutDashboard, Monitor, AlertTriangle, Activity, Settings, LogOut, Wifi, UserPlus, Wrench } from 'lucide-react'
 import { useAlerts } from '../../context/AlertContext'
 import { useAuth } from '../../context/AuthContext'
 
@@ -9,7 +9,10 @@ const navSections = [
     items: [
       { to: '/', icon: LayoutDashboard, label: 'Overview' },
       { to: '/devices', icon: Monitor, label: 'Devices' },
+      { to: '/access-points', icon: Wifi, label: 'Access Points' },
+      { to: '/onboarding', icon: UserPlus, label: 'Onboarding' },
       { to: '/alerts', icon: AlertTriangle, label: 'Alerts', badge: true },
+      { to: '/troubleshooting', icon: Wrench, label: 'Troubleshooting' },
       { to: '/traffic', icon: Activity, label: 'Traffic' },
     ],
   },

@@ -1,62 +1,127 @@
-system:
-  mode: observation
-  kafka_bootstrap: localhost:9092
-prtg:
-  base_url: https://prtg.example.local
-  api_token: ''
-  poll_interval_sec: 60
-  avg_interval_sec: 60
-  poll_lag_sec: 30
-devices:
-- ip: 10.0.0.5
-  name: core-router-01
-  building: HQ
-  sensors: {}
-- ip: 10.0.0.6
-  name: edge-switch-floor2
-  building: HQ
-  sensors: {}
-- ip: 10.0.0.7
-  name: branch-router-01
-  building: Branch-A
-  sensors: {}
 bootstrap:
-  min_collection_days: 14
-  min_netflow_records: 100000
-  training_hour_utc: 2
+  min_collection_days: 3
+  min_netflow_records: 80000
   retrain_interval_days: 7
   rolling_training_window_days: 90
+  training_hour_utc: 11
+devices:
+- building: HQ/Core
+  device_type: router
+  ip: 10.0.1.1
+  name: hq-core-router-r1
+  sensors:
+    snmp:
+      community: public
+      enabled: true
+      host: 10.255.0.1
+      if_index: 4
+      if_speed_bps: 100000000
+      output_ip: 10.0.1.1
+      port: 161
+  source: settings_page
+- building: Branch
+  device_type: router
+  ip: 10.0.2.1
+  name: branch-router-r2
+  sensors:
+    snmp:
+      community: public
+      enabled: true
+      host: 10.255.0.2
+      if_index: 2
+      if_speed_bps: 100000000
+      output_ip: 10.0.2.1
+      port: 161
+  source: settings_page
+- ip: 10.0.1.21
+  name: access_point-AP-LIB-001
+  building: Unassigned
+  device_type: access_point
+  source: settings_page
+  sensors:
+    snmp:
+      enabled: true
+      host: 10.255.0.31
+      community: public
+      port: 161
+      if_index: 1
+      if_speed_bps: 100000000
+      output_ip: 10.0.1.21
+  role: Wireless Access Point
+  serial_number: AP-LIB-001
+  mac_address: 02:00:00:00:07:00
+live_runtime:
+  enabled: true
+  poll_interval_sec: 10
+  preview_minutes: 5
+  stale_alert_windows: 2
+  telemetry_cache_hours: 8
+onboarding:
+  auto_register_on_approval: true
+  enrollment_secret: enrollmentsecret
+  store_file: data/onboarding/devices.json
+  templates_dir: data/onboarding/generated_configs
 paths:
-  netflow_raw_dir: data/raw
-  prtg_raw_dir: data/raw
-  processed_dir: data/processed
-  models_dir: data/models
   alerts_dir: data/alerts
-snmp_prtg:
-  community: public
+  models_dir: data/models
+  netflow_raw_dir: data/raw
+  processed_dir: data/processed
+  prtg_raw_dir: data/raw
+prtg:
+  api_token: ''
+  avg_interval_sec: 60
+  base_url: https://prtg.example.local
   poll_interval_sec: 60
-  timeout_sec: 2
-  retries: 1
-
-
+  poll_lag_sec: 30
 security:
-  # Set NETSCOPE_JWT_SECRET in production. If omitted, the API generates an
-  # ephemeral in-memory secret, which logs users out on restart.
-  token_ttl_minutes: 480
-  users_file: data/security/users.json
-  audit_log_path: data/audit/audit.log
   allow_registration: false
-  login_max_failures: 5
-  login_lockout_minutes: 15
-  cors_allowed_origins:
-  - http://localhost:5173
-  - http://127.0.0.1:5173
-  # Turn this on in production after setting the CIDRs for your LAN/NOC subnet.
-  enforce_ip_allowlist: false
   allowed_cidrs:
   - 127.0.0.1/32
   - ::1/128
   - 10.0.0.0/8
   - 172.16.0.0/12
   - 192.168.0.0/16
+  audit_log_path: data/audit/audit.log
+  cors_allowed_origins:
+  - http://localhost:5173
+  - http://127.0.0.1:5173
+  enforce_ip_allowlist: false
   force_https: false
+  login_lockout_minutes: 15
+  login_max_failures: 5
+  token_ttl_minutes: 300
+  users_file: data/security/users.json
+snmp_prtg:
+  community: public
+  poll_interval_sec: 60
+  retries: 1
+  timeout_sec: 2
+system:
+  kafka_bootstrap: localhost:9092
+  mode: observation
+topology:
+  links:
+  - interface: r1-r2
+    source: hq-core-router-r1
+    target: branch-router-r2
+    type: wan
+  - interface: r1-dmz
+    source: hq-core-router-r1
+    target: web-server
+    type: dmz
+  - interface: r1-dmz
+    source: hq-core-router-r1
+    target: dns-server
+    type: dmz
+  - interface: r2-branch
+    source: branch-router-r2
+    target: branch-server
+    type: lan
+  - interface: r1-hq
+    source: hq-core-router-r1
+    target: access_point-AP-LIB-001
+    type: wireless
+troubleshooting:
+  default_analysis_window_hours: 24
+  incident_confidence_threshold: 40
+  syslog_events_file: data/syslogs/syslog_events.jsonl

@@ -3,7 +3,6 @@ import { useNavigate } from 'react-router-dom'
 import { Search } from 'lucide-react'
 import { usePolling } from '../hooks/usePolling'
 import { getDevices } from '../api/topology'
-import { getHealthScores } from '../api/alerts'
 import { StatusDot, HealthScore, PulseStrip, Skeleton, EmptyState } from '../components/Shared'
 
 export default function Devices() {
@@ -13,18 +12,8 @@ export default function Devices() {
   const [sort, setSort] = useState('name')
 
   const fetchDevices = useCallback(() => getDevices(), [])
-  const fetchScores = useCallback(() => getHealthScores(), [])
   const { data: devices, loading } = usePolling(fetchDevices, 20_000)
-  const { data: scores } = usePolling(fetchScores, 20_000)
-
-  // merge health scores into device list
-  const merged = useMemo(() => {
-    if (!devices) return []
-    return devices.map(d => ({
-      ...d,
-      health_score: scores?.[d.ip] ?? d.health_score,
-    }))
-  }, [devices, scores])
+  const merged = useMemo(() => devices || [], [devices])
 
   const filtered = useMemo(() => {
     let list = merged.filter(d => {
@@ -62,7 +51,7 @@ export default function Devices() {
         </div>
         <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} style={selectStyle}>
           <option value="all">All Status</option>
-          <option value="online">Online</option>
+          <option value="healthy">Healthy</option>
           <option value="offline">Offline</option>
           <option value="degraded">Degraded</option>
           <option value="unknown">Unknown</option>

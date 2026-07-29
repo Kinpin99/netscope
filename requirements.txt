@@ -11,7 +11,7 @@ requests>=2.31
 
 # SNMP-backed PRTG simulation collector
 # The collector works with the system `snmpget` command by default.
-# Install pysnmp only if you want the pure-Python backend.
+# Install pysnmp only if you want the pure Python backend.
 pysnmp>=4.4 ; python_version < "3.13"
 
 # Model training
@@ -20,6 +20,9 @@ joblib>=1.3
 
 # Orchestrator scheduling
 APScheduler>=3.10
+
+# Topology/root-cause analysis
+networkx>=3.0
 
 # API
 fastapi>=0.110

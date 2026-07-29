@@ -1,3 +1,24 @@
+"""
+system_state.py
+-----------------
+Persists the orchestrator's lifecycle phase across restarts.
+
+Phases (see orchestrator.py for the full state machine):
+    OBSERVATION  - collecting data, no models exist yet, no detection running
+    TRAINING     - training pipeline is currently running (transient)
+    INFERENCE    - models exist and are loaded, live detection running
+
+State is stored as JSON at data/models/system_state.json (alongside the
+models themselves, since the state is fundamentally "what models exist and
+when were they last refreshed").
+
+This is intentionally a thin, dependency-free module - the API's
+routes_system.py reads this same file to show the dashboard's
+"Collecting baseline data (Day 4 of 14)" / "Training models..." /
+"Live detection active" banner, without needing to talk to the
+orchestrator process directly.
+"""
+
 import json
 import time
 from pathlib import Path
@@ -11,6 +32,22 @@ VALID_PHASES = {PHASE_OBSERVATION, PHASE_TRAINING, PHASE_INFERENCE}
 
 
 class SystemState:
+    """
+    Wraps a JSON state file. All reads/writes go through this class so the
+    on-disk schema is defined in exactly one place.
+
+    Schema:
+        {
+          "phase": "observation" | "training" | "inference",
+          "observation_started_at": <epoch> | null,
+          "last_training_started_at": <epoch> | null,
+          "last_training_completed_at": <epoch> | null,
+          "last_training_result": "passed" | "failed" | null,
+          "last_retrain_at": <epoch> | null,
+          "models_version": <int>,           # incremented on each successful promotion
+          "notes": <string>                  # free-text, shown on dashboard
+        }
+    """
 
     def __init__(self, path: Path):
         self.path = path
@@ -39,9 +76,10 @@ class SystemState:
         tmp_path = self.path.with_suffix(".tmp")
         with open(tmp_path, "w") as f:
             json.dump(state, f, indent=2)
-        tmp_path.replace(self.path)
+        tmp_path.replace(self.path)  # atomic on POSIX
 
-    # Public API
+    # -- Public API -----------------------------------------------------
+
     def get(self) -> Dict[str, Any]:
         return self._read()
 
@@ -74,7 +112,7 @@ class SystemState:
             state["last_retrain_at"] = time.time()
             state["models_version"] = state.get("models_version", 0) + 1
         else:
-            # Roll back to whatever phase we were in before training
+            # Roll back to whatever phase we were in before training -
             # if models already existed, stay in INFERENCE on the old
             # models; if this was the first-ever training, fall back to
             # OBSERVATION so the system keeps collecting data and retries.

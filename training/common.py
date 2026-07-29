@@ -1,3 +1,32 @@
+"""
+training/common.py
+--------------------
+Shared utilities for the four train_*.py scripts.
+
+Key design decisions:
+
+  - Models are Isolation Forest by default (unsupervised - matches the
+    NOTE in anomaly_features.txt that only Random Forest and Isolation
+    Forest will be used, and IF doesn't require labelled anomalies).
+    A Random Forest path is also provided for detectors where labelled
+    data becomes available later (e.g. from CICIDS/UNSW-NB15 or synthetic
+    attacks), selectable via --model-type.
+
+  - Every saved model is a dict: {"model": <sklearn estimator>,
+    "feature_columns": [...], "model_type": "isolation_forest"|"random_forest",
+    "trained_at": <epoch>, "training_rows": N}
+    The feature_columns list is saved alongside the model because live
+    inference MUST build its feature vector in this exact column order -
+    sklearn estimators have no awareness of column names, only column
+    position. Storing this list here (rather than relying on
+    unified_preprocessing's output column order matching forever) is the
+    safeguard against silent training/inference feature misalignment.
+
+  - Identifier columns (device_ip, src_ip, window, etc.) are excluded from
+    the feature matrix automatically via FEATURE_EXCLUDE_COLS / the
+    *_output_columns() ID prefixes.
+"""
+
 import json
 import sys
 import time
@@ -13,7 +42,7 @@ from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.model_selection import train_test_split
 
 # Columns that identify a row (device/window/source) rather than describe
-# its behavior are never fed to the model.
+# its behavior - never fed to the model.
 ID_COLUMNS = {"device_ip", "src_ip", "window", "label"}
 
 
@@ -30,8 +59,10 @@ def feature_columns(df: pd.DataFrame) -> List[str]:
 
 def to_matrix(df: pd.DataFrame, columns: List[str]) -> np.ndarray:
     """
-    Build a numeric feature matrix from df using exactly `columns` in that
-    order
+    Build a numeric feature matrix from df using exactly `columns`, in that
+    order. Missing columns are filled with 0 (e.g. a live inference batch
+    that happens to have no flows of a particular protocol, producing a
+    feature set with fewer columns than training saw).
     """
     out = pd.DataFrame(index=df.index)
     for c in columns:
@@ -80,7 +111,9 @@ def save_model(
     extra_meta: Optional[dict] = None,
 ) -> None:
     """
-    Save model + the metadata live inference needs to use it correctly
+    Save model + the metadata live inference needs to use it correctly.
+    `feature_cols` is the single most important field here - it pins the
+    exact column order the model expects.
     """
     bundle = {
         "model": model,
@@ -103,7 +136,12 @@ def load_model(path: Path) -> dict:
 
 def score_isolation_forest(bundle: dict, df: pd.DataFrame) -> np.ndarray:
     """
-    Return anomaly scores in [0, 1], where higher equals more anomalous
+    Return anomaly scores in [0, 1], where higher = more anomalous.
+
+    sklearn's IsolationForest.score_samples returns higher values for
+    *normal* points (less negative) and lower (more negative) for
+    anomalies. We flip and rescale via decision_function so that the
+    output is intuitive for the alert engine: 0 = normal, 1 = anomalous.
     """
     X = to_matrix(df, bundle["feature_columns"])
     model: IsolationForest = bundle["model"]
@@ -120,6 +158,12 @@ def split_train_eval(
     random_state: int = 42,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
+    Time-aware split: the last eval_fraction of rows (by `window`, if
+    present) become the evaluation set, rest is training. This is more
+    realistic than a random split for time-series anomaly data - it
+    evaluates the model on the period that most resembles "the future"
+    relative to training, similar to how live inference will behave.
+
     Falls back to a random split if `window` isn't present.
     """
     if "window" in df.columns:
@@ -138,6 +182,11 @@ def write_normalization_stats_slice(
     slice_stats: Dict[str, Dict[str, float]],
 ) -> None:
     """
+    Merge `slice_stats` under `stats[key]` into normalization_stats.json,
+    preserving other detectors' entries. Each train_*.py script calls this
+    for its own detector slice ("bandwidth", "device_behavior", etc.)
+    rather than overwriting the whole file, since multiple training scripts
+    run in the same pipeline and each only knows its own slice.
     """
     stats = {}
     if stats_path.exists():

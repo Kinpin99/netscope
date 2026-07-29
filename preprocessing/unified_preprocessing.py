@@ -1,3 +1,24 @@
+"""
+Single source of truth for all feature engineering
+
+Design principles:
+- One class per detector: BandwidthFeatures, PortScanFeatures,
+  DeviceBehaviorFeatures, ProtocolFeatures.
+- Each class exposes two entry points that return identical DataFrames:
+    .from_csv(netflow_csv, snmp_csv)   — training pipeline
+    .from_stream(netflow_df, snmp_df)  — live inference (Kafka feeds these)
+- All intermediate computations are private methods shared between both
+  entry points, guaranteeing zero train/serve skew.
+- Window aggregation, z-score computation, entropy, and rolling baselines
+  are all done inside this module.
+
+
+Window
+All features are computed per TIME_WINDOW_SEC (default 60 s).
+Multiple window sizes can be stacked as separate feature columns
+(see WINDOW_SIZES in each class).
+"""
+
 import math
 import warnings
 from pathlib import Path
@@ -11,6 +32,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
 # Shared constants
+
 TIME_WINDOW_SEC = 60          # primary aggregation window
 
 PROTOCOL_TCP  = 6
@@ -27,7 +49,19 @@ WELL_KNOWN_PORT_MAX = 1024
 
 
 # Shared helpers
+
 def _load_netflow(path: str) -> pd.DataFrame:
+    """
+    Load NetFlow records from either:
+      - a single CSV file path, or
+      - a directory containing daily-rotated files named
+        netflow_raw_<YYYY-MM-DD>.csv (as produced by netflow_collector.py's
+        RotatingCsvWriter), in which case all matching files are concatenated.
+
+    This avoids ever needing one unbounded multi-month CSV: old daily files
+    can simply be deleted by a retention job and this loader picks up
+    whatever remains.
+    """
     p = Path(path)
     if p.is_dir():
         files = sorted(p.glob("netflow_raw_*.csv"))
@@ -46,6 +80,17 @@ def _load_netflow(path: str) -> pd.DataFrame:
 
 
 def _load_snmp(path: str) -> pd.DataFrame:
+    """
+    Load interface/device metrics (PRTG or SNMP-derived) from a CSV file or
+    a directory of daily-rotated files (prtg_raw_<YYYY-MM-DD>.csv).
+
+    The expected schema (regardless of source) is:
+        timestamp, device_ip, if_in_octets, if_out_octets, if_speed,
+        if_in_errors, cpu_load_pct, mem_used_pct
+    This is the contract prtg_collector.py must satisfy so this module
+    never needs to know whether the data came from raw SNMP polling or
+    PRTG's REST API.
+    """
     p = Path(path)
     if p.is_dir():
         files = sorted(p.glob("prtg_raw_*.csv")) or sorted(p.glob("snmp_raw_*.csv"))
@@ -76,6 +121,22 @@ def _assign_window(df: pd.DataFrame, window_sec: int = TIME_WINDOW_SEC) -> pd.Da
 
 
 def _assign_device_ip(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Determine which IP in a flow represents the "device being profiled".
+
+    Shared by BandwidthFeatures, DeviceBehaviorFeatures, and ProtocolFeatures
+    so all three detectors agree on whose behavior a flow counts towards.
+
+    Heuristic: if the destination is a private (RFC-1918) address, the flow
+    is inbound to one of our monitored devices, so dst_ip is the device.
+    Otherwise (outbound flow initiated by an internal device, or
+    private-to-private), src_ip is the device.
+
+    Without this, a flow FROM an external attacker TO an internal device
+    would be attributed entirely to the external IP, and the internal
+    device's profile would never see it - exactly the traffic we most want
+    to catch for device-behavior and protocol-anomaly detection.
+    """
     df = df.copy()
     is_inbound = df["dst_ip"].apply(_is_private_ip).astype(bool)
     df["device_ip"] = np.where(is_inbound, df["dst_ip"], df["src_ip"])
@@ -98,7 +159,18 @@ def _rolling_zscore(
     df: pd.DataFrame, group_col: str, value_col: str,
     window: int = 1440,                    # minutes of history
 ) -> pd.Series:
+    """
+    TRAINING ONLY. For each group (e.g. device IP), compute a z-score of
+    value_col relative to a rolling historical window within df itself.
+    Returns a Series aligned to df.index.
 
+    This requires df to already contain >= `window` rows of history per
+    group, which is true for a multi-day training CSV but NOT true for a
+    live inference call that only has the current 1-minute window's data.
+    For live inference, use `_zscore_from_stats` with persisted
+    per-device statistics instead (see compute_normalization_stats /
+    normalization_stats.json).
+    """
     result = pd.Series(np.nan, index=df.index)
     for grp, gdf in df.groupby(group_col):
         vals = gdf[value_col]
@@ -110,6 +182,12 @@ def _rolling_zscore(
 
 
 def _zscore_from_stats(value: float, mean: float, std: float) -> float:
+    """
+    LIVE INFERENCE. Compute a z-score for a single value against
+    pre-computed historical mean/std (loaded from normalization_stats.json).
+    Returns 0.0 if std is 0/missing, matching the fillna(0) convention used
+    in training so live and trained feature distributions line up.
+    """
     if std is None or std == 0 or pd.isna(std) or pd.isna(mean):
         return 0.0
     return (value - mean) / std
@@ -122,6 +200,14 @@ def _apply_stats_zscore(
     stats: Dict[str, Dict[str, float]],
     out_col: Optional[str] = None,
 ) -> pd.Series:
+    """
+    Vectorized helper: for each row, look up {group_col value -> {mean, std}}
+    in `stats` (a dict keyed by group_col, e.g. device_ip, with
+    {"<value_col>_mean": ..., "<value_col>_std": ...} entries) and compute
+    a z-score via _zscore_from_stats. Devices missing from `stats`
+    (e.g. brand-new devices with no history yet) get 0.0, same as the
+    min_periods fallback in training.
+    """
     out_col = out_col or f"{value_col}_zscore"
     means = df[group_col].map(lambda g: stats.get(g, {}).get(f"{value_col}_mean"))
     stds  = df[group_col].map(lambda g: stats.get(g, {}).get(f"{value_col}_std"))
@@ -140,6 +226,23 @@ def compute_normalization_stats(
     group_col: str,
     value_cols: List[str],
 ) -> Dict[str, Dict[str, float]]:
+    """
+    Compute per-group (per-device) mean/std for each value_col, to be
+    persisted to normalization_stats.json after training (and refreshed
+    periodically by the orchestrator's retraining job).
+
+    Output shape:
+        {
+          "10.0.0.5": {"bw_in_bytes_mean": ..., "bw_in_bytes_std": ..., ...},
+          "10.0.0.6": {...},
+          ...
+        }
+
+    The live preprocessing path (`from_stream`) loads this file and passes
+    it to `_apply_stats_zscore` so live z-scores are computed against the
+    same historical baseline the model was trained on, rather than against
+    whatever tiny amount of data happens to be in the current Kafka batch.
+    """
     stats: Dict[str, Dict[str, float]] = {}
     for grp, gdf in feat_df.groupby(group_col):
         entry = {}
@@ -151,12 +254,41 @@ def compute_normalization_stats(
     return stats
 
 
-
+# ===========================================================================
 # 1. BandwidthFeatures
+
+
 class BandwidthFeatures:
+    """
+    Features for the Bandwidth Spike Detector.
+
+    Output columns (per device, per window):
+        device_ip, window,
+        bw_in_bytes, bw_out_bytes,
+        bw_in_pkts,  bw_out_pkts,
+        bw_in_rate_bps, bw_out_rate_bps,
+        bw_in_zscore,   bw_out_zscore,
+        if_util_in,  if_util_out,
+        if_errors_delta,
+        cpu_load_pct, mem_used_pct
+
+    Z-score columns:
+        TRAINING (from_csv): computed via rolling history within the
+        training CSV itself (_rolling_zscore).
+
+        LIVE (from_stream): computed against persisted per-device
+        normalization_stats (normalization_stats.json), passed in via the
+        `normalization_stats` argument. Without this argument, z-scores
+        default to 0.0 for every row - the same value a brand-new device
+        with no history would get during training. This is what avoids
+        the "live z-scores are always 0 because there's no in-memory
+        history" issue: the stats are computed once during training (or
+        the periodic retraining job) and reused across every live call.
+    """
+
     WINDOW_SEC = TIME_WINDOW_SEC
 
-    # For z-score rolling history: number of windows to look back - training only
+    # For z-score rolling history (number of windows to look back) - training only
     ROLLING_WINDOW = 1440  # 1 day if windows are 1 min each
 
     ZSCORE_VALUE_COLS = ["bw_in_bytes", "bw_out_bytes"]
@@ -182,6 +314,10 @@ class BandwidthFeatures:
     ) -> pd.DataFrame:
         """
         Compute features from already-loaded DataFrames. For live inference.
+
+        normalization_stats: per-device {col_mean, col_std} dict, loaded from
+        normalization_stats.json. If None, z-scores are 0.0 (equivalent to
+        "no history yet" - same as training's min_periods fallback).
         """
         feat = cls._compute(netflow_df.copy(), snmp_df.copy())
         stats = (normalization_stats or {}).get("bandwidth", {})
@@ -207,7 +343,9 @@ class BandwidthFeatures:
         nf = _assign_window(nf, cls.WINDOW_SEC)
 
         # Determine direction relative to the monitored network, and which
-        # IP the flow's traffic should be attributed to
+        # IP the flow's traffic should be attributed to (shared helper -
+        # see _assign_device_ip docstring for why this matters for
+        # inbound-from-external traffic).
         nf["is_inbound"] = nf["dst_ip"].apply(_is_private_ip).astype(bool)
         nf = _assign_device_ip(nf)
 
@@ -269,15 +407,33 @@ class BandwidthFeatures:
         return feat
 
 
-
+# ===========================================================================
 # 2. PortScanFeatures
+
+
 class PortScanFeatures:
+    """
+    Features for the Port Scan Detector.
+
+    Computed per (src_ip, window).
+
+    Output columns:
+        src_ip, window,
+        flows_total, flows_per_sec,
+        distinct_dst_ports, distinct_dst_ips,
+        port_entropy,
+        tcp_syn_ratio, udp_ratio,
+        success_rate,
+        small_flow_ratio,
+        well_known_port_ratio
+    """
+
     WINDOW_SEC = TIME_WINDOW_SEC
     SMALL_FLOW_THRESHOLD_SEC = 3.0
 
     @classmethod
     def from_csv(cls, netflow_csv: str) -> pd.DataFrame:
-        """PortScan detection is NetFlow-only so no SNMP/PRTG input needed."""
+        """PortScan detection is NetFlow-only - no SNMP/PRTG input needed."""
         nf = _load_netflow(netflow_csv)
         return cls._compute(nf)
 
@@ -331,9 +487,37 @@ class PortScanFeatures:
         return pd.DataFrame(rows)
 
 
-
+# ===========================================================================
 # 3. DeviceBehaviorFeatures
+
 class DeviceBehaviorFeatures:
+    """
+    Features for the Device Behavior / Unknown Device Detector.
+
+    Computed per (device_ip, window). Requires historical baseline to
+    produce z-scores.
+
+    Output columns:
+        device_ip, window,
+        bytes_in, bytes_out,
+        bytes_in_zscore, bytes_out_zscore,
+        tcp_ratio, udp_ratio, icmp_ratio,
+        distinct_dst_ips, distinct_dst_ips_zscore,
+        hour_sin, hour_cos,
+        cpu_util_zscore, mem_util_zscore
+
+    device_ip is assigned via the shared _assign_device_ip helper (not
+    simply src_ip) so that inbound traffic FROM external hosts TO an
+    internal device is correctly attributed to that internal device's
+    behavioral profile - otherwise an internal device being probed or
+    attacked from outside would never show up as "behaving differently".
+
+    Z-scores: from_csv computes rolling z-scores from in-CSV history
+    (training). from_stream computes z-scores from persisted
+    normalization_stats (live inference) - see BandwidthFeatures docstring
+    for the rationale.
+    """
+
     WINDOW_SEC    = TIME_WINDOW_SEC
     ROLLING_WINDOW = 1440
 
@@ -441,12 +625,28 @@ class DeviceBehaviorFeatures:
         return feat
 
 
-
+# ===========================================================================
 # 4. ProtocolFeatures
+
 class ProtocolFeatures:
+    """
+    Features for the Suspicious Protocol Usage Detector.
+
+    Computed per (device_ip, window).
+
+    Output columns:
+        device_ip, window,
+        protocol_entropy,
+        tcp_ratio, udp_ratio, icmp_ratio, other_ratio,
+        num_new_protocols,
+        port_protocol_mismatch_count,
+        avg_pkt_size_tcp, avg_pkt_size_udp,
+        kl_div_from_baseline
+    """
+
     WINDOW_SEC = TIME_WINDOW_SEC
 
-    # Well-known port: expected protocol mapping for mismatch detection
+    # Well-known port → expected protocol mapping for mismatch detection
     PORT_PROTOCOL_EXPECTED: Dict[int, int] = {
         53:  PROTOCOL_UDP,   # DNS (TCP/53 tunneling is suspicious)
         80:  PROTOCOL_TCP,
@@ -461,6 +661,14 @@ class ProtocolFeatures:
 
     @classmethod
     def from_csv(cls, netflow_csv: str, baseline_csv: Optional[str] = None) -> pd.DataFrame:
+        """
+        baseline_csv: optional path to a CSV with columns [device_ip, protocol, ratio]
+                      representing each device's historical protocol distribution.
+                      If None, or if the file doesn't exist yet (e.g. first-ever
+                      training run before train_protocol_model.py has produced
+                      protocol_baseline.csv), KL divergence and num_new_protocols
+                      default to 0/0 for every row.
+        """
         nf = _load_netflow(netflow_csv)
         baseline = _load_baseline(baseline_csv) if baseline_csv else {}
         return cls._compute(nf, baseline)
@@ -473,7 +681,7 @@ class ProtocolFeatures:
     @classmethod
     def _compute(cls, nf: pd.DataFrame, baseline: dict) -> pd.DataFrame:
         nf = _assign_window(nf, cls.WINDOW_SEC)
-        nf = _assign_device_ip(nf)   # shared helper
+        nf = _assign_device_ip(nf)   # shared helper - see _assign_device_ip docstring
 
         nf["is_tcp"]   = (nf["protocol"] == PROTOCOL_TCP)
         nf["is_udp"]   = (nf["protocol"] == PROTOCOL_UDP)
@@ -554,8 +762,9 @@ class ProtocolFeatures:
         return pd.DataFrame(rows)
 
 
-
+# ---------------------------------------------------------------------------
 # Helpers
+
 def _is_private_ip(ip: str) -> bool:
     """Return True if IP is RFC-1918 private or loopback."""
     try:
@@ -586,7 +795,16 @@ def _kl_divergence(p: dict, q: dict) -> float:
 
 
 def _load_baseline(path: str) -> dict:
+    """
+    Load a protocol baseline CSV with columns: device_ip, protocol, ratio.
+    Returns dict: device_ip -> {protocol_int: ratio_float}
 
+    Returns {} (empty baseline -> KL divergence 0, num_new_protocols 0 for
+    every row) if the file doesn't exist. This is expected on the very
+    first training run, before train_protocol_model.py has ever produced
+    protocol_baseline.csv - without this guard, build_all_features would
+    raise FileNotFoundError on a brand-new system.
+    """
     if not Path(path).exists():
         return {}
 
@@ -602,9 +820,31 @@ def _load_baseline(path: str) -> dict:
     return baseline
 
 
-
+# ---------------------------------------------------------------------------
 # Convenience: build all four feature sets in one call
+
 def build_all_normalization_stats(features: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """
+    Given the dict returned by build_all_features (training), compute the
+    per-device normalization stats needed by from_stream's z-score columns
+    at live-inference time.
+
+    Output shape (this is what gets written to normalization_stats.json):
+        {
+          "bandwidth": {
+            "10.0.0.5": {"bw_in_bytes_mean": ..., "bw_in_bytes_std": ..., ...},
+            ...
+          },
+          "device_behavior": {
+            "10.0.0.5": {"bytes_in_mean": ..., "bytes_in_std": ..., ...},
+            ...
+          }
+        }
+
+    Called by training/train_*.py after feature computation, and again by
+    the orchestrator's periodic retraining job so the baseline drifts with
+    real network behavior over time.
+    """
     stats: Dict[str, Dict[str, Dict[str, float]]] = {}
 
     if "bandwidth" in features and not features["bandwidth"].empty:
@@ -628,6 +868,9 @@ def build_all_features(
     """
     Compute all four feature DataFrames from raw CSVs. For training.
     Returns a dict keyed by detector name.
+
+    netflow_csv / snmp_csv may be either single file paths or directory
+    paths containing daily-rotated files (see _load_netflow / _load_snmp).
     """
     return {
         "bandwidth":       BandwidthFeatures.from_csv(netflow_csv, snmp_csv),

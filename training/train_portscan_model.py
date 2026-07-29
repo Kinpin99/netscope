@@ -1,3 +1,30 @@
+"""
+train_portscan_model.py
+-------------------------
+Trains the Port Scan Detector model.
+
+Pipeline:
+    netflow_raw  --[unified_preprocessing.PortScanFeatures]-->
+    portscan_features.csv  --[IsolationForest or RandomForest]--> portscan_model.pkl
+
+Port scan is the detector most amenable to labelled training data: synthetic
+scans (e.g. via nmap/Scapy against a test environment) or public datasets
+like CICIDS2017/UNSW-NB15 can provide a "label" column (1=scan, 0=normal).
+
+If the loaded features include a "label" column, a Random Forest classifier
+is trained instead of Isolation Forest. Otherwise (the default, no labels
+available yet), Isolation Forest runs unsupervised - consistent with the
+NOTE in anomaly_features.txt restricting models to RF/IF.
+
+To add labels: merge a "label" column into portscan_features.csv (by
+src_ip + window) before running this script, or pass --labelled-csv
+pointing at a separate labelled dataset with the same feature columns.
+
+Usage:
+    python training/train_portscan_model.py
+    python training/train_portscan_model.py --labelled-csv data/processed/cicids_portscan.csv
+"""
+
 import argparse
 import sys
 from pathlib import Path
@@ -66,7 +93,7 @@ def main():
         contamination = float(contamination)
 
     if labelled_df is not None:
-        # Supervised: Random Forest
+        # --- Supervised: Random Forest ---
         train_df, eval_df = split_train_eval(labelled_df)
         cols = feature_columns(train_df)
         log.info("Training Random Forest with feature columns (%d): %s", len(cols), cols)
@@ -86,7 +113,7 @@ def main():
             log.info("Eval accuracy: %.4f (%d rows)", acc, len(eval_df))
 
     else:
-        # Unsupervised: Isolation Forest
+        # --- Unsupervised: Isolation Forest ---
         train_df, eval_df = split_train_eval(feat)
         cols = feature_columns(train_df)
         log.info("Training Isolation Forest with feature columns (%d): %s", len(cols), cols)

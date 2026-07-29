@@ -1,4 +1,6 @@
 """
+api/security.py
+----------------
 Production-oriented security helpers for the dashboard API.
 
 Implemented controls:

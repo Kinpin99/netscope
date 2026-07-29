@@ -1,3 +1,41 @@
+"""
+train_device_model.py
+-----------------------
+Trains the Device Behavior / Unknown Device Detector model.
+
+Pipeline:
+    netflow_raw + prtg_raw  --[unified_preprocessing.DeviceBehaviorFeatures]-->
+    device_behavior_features.csv  --[IsolationForest]--> device_model.pkl
+                                   --[compute_normalization_stats]--> normalization_stats.json["device_behavior"]
+
+Two modes:
+
+  --mode global (default)
+      One model trained across all devices. This is the model loaded by
+      the live ensemble_detector for devices that don't have their own
+      per-device baseline.
+
+  --mode per-device --device-ip <ip>
+      Trains a dedicated model for a single device, saved as
+      data/models/device_profiles/<ip>_model.pkl, plus a per-device slice
+      of normalization_stats.json under
+      normalization_stats.json["device_behavior_profiles"][<ip>].
+
+      This implements must_add_to_project.txt item 6: "on user request,
+      can create a 'normal baseline' for a particular device". The
+      orchestrator/API calls this mode when an admin requests a baseline
+      for a specific device (typically after a >=24h observation window
+      for that device specifically).
+
+      If a per-device model exists for a device, the live ensemble
+      detector should prefer it over the global model for that device's
+      rows - see profiling/profile_updater.py.
+
+Usage:
+    python training/train_device_model.py
+    python training/train_device_model.py --mode per-device --device-ip 10.0.0.5
+"""
+
 import argparse
 import json
 import sys
@@ -102,7 +140,13 @@ def _train_global(feat: pd.DataFrame, processed_dir: Path, models_dir: Path, con
 
 def _train_per_device(feat: pd.DataFrame, device_ip: str, models_dir: Path, contamination) -> None:
     """
-    must_add_to_project.txt number 6: on-request "normal baseline" for one device.
+    must_add_to_project.txt item 6: on-request "normal baseline" for one device.
+
+    Trains a dedicated Isolation Forest on only this device's historical
+    windows. The live ensemble detector (profiling/profile_updater.py)
+    checks for data/models/device_profiles/<ip>_model.pkl and, if present,
+    scores that device's rows with this model instead of the global one -
+    giving a tighter, device-specific notion of "normal".
     """
     dev_feat = feat[feat["device_ip"] == device_ip]
     if dev_feat.empty:
@@ -143,6 +187,8 @@ def _train_per_device(feat: pd.DataFrame, device_ip: str, models_dir: Path, cont
     log.info("Saved per-device model -> %s (trained on %d rows)", model_path, len(train_df))
 
     # Per-device normalization stats, stored separately from the global
+    # device_behavior stats so a per-device profile doesn't get overwritten
+    # by the next global retrain.
     dev_stats = compute_normalization_stats(dev_feat, "device_ip", DeviceBehaviorFeatures.ZSCORE_VALUE_COLS)
 
     stats_path = models_dir / "normalization_stats.json"

@@ -19,6 +19,7 @@ config_path, relying on load_config()'s default) pick up the fixture's
 config.yaml.
 """
 
+import os
 import random
 import sys
 import time
@@ -113,6 +114,12 @@ def api_project(tmp_path, monkeypatch):
             "models_dir": str(project_dir / "data" / "models"),
             "alerts_dir": str(project_dir / "data" / "alerts"),
         },
+        "security": {
+            "users_file": str(project_dir / "data" / "security" / "users.json"),
+            "audit_log_path": str(project_dir / "data" / "audit" / "audit.log"),
+            "allow_registration": False,
+            "enforce_ip_allowlist": False,
+        },
     }
     config_path = project_dir / "config.yaml"
     with open(config_path, "w") as f:
@@ -144,8 +151,16 @@ def api_project(tmp_path, monkeypatch):
         scores = score_window(wnf, wsnmp, models)
         engine.process_window(scores)
 
+    monkeypatch.setenv("NETSCOPE_JWT_SECRET", "test-secret")
+    monkeypatch.setenv("NETSCOPE_BOOTSTRAP_USERNAME", "admin")
+    monkeypatch.setenv("NETSCOPE_BOOTSTRAP_PASSWORD", "AdminPass123!")
+
     from api.main import app
-    return TestClient(app), project_dir, config_path
+    client = TestClient(app)
+    login = client.post("/auth/login", json={"username": "admin", "password": "AdminPass123!"})
+    assert login.status_code == 200
+    client.headers.update({"Authorization": "Bearer " + login.json()["access_token"]})
+    return client, project_dir, config_path
 
 
 # ---------------------------------------------------------------------------

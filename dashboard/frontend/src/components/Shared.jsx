@@ -30,6 +30,7 @@ export function SeverityBadge({ severity }) {
 export function StatusDot({ status, size = 8 }) {
   const colors = {
     online: 'var(--accent)',
+    healthy: 'var(--accent)',
     degraded: 'var(--sev-medium)',
     offline: 'var(--sev-critical)',
     unknown: 'var(--sev-unknown)',
@@ -43,7 +44,7 @@ export function StatusDot({ status, size = 8 }) {
         height: size,
         borderRadius: '50%',
         background: c,
-        boxShadow: status === 'online' ? `0 0 6px ${c}` : 'none',
+        boxShadow: status === 'online' || status === 'healthy' ? `0 0 6px ${c}` : 'none',
         flexShrink: 0,
       }}
     />

@@ -5,13 +5,12 @@ import { usePolling } from '../hooks/usePolling'
 import { useAlerts } from '../context/AlertContext'
 import { useSystem } from '../context/SystemContext'
 import { getBuildings } from '../api/topology'
-import { healthColor } from '../utils/format'
 import { SeverityBadge, StatusDot, HealthScore, PulseStrip, AlertItem, EmptyState, Skeleton } from '../components/Shared'
+import NetworkCompositionChart from '../components/NetworkCompositionChart'
 
 function BuildingCard({ building }) {
   const [open, setOpen] = useState(building.devices.length <= 5)
   const navigate = useNavigate()
-  const avgColor = healthColor(building.avg_health_score)
 
   return (
     <div className="panel" style={{ marginBottom: 12 }}>
@@ -80,6 +79,9 @@ export default function Overview() {
 
   return (
     <div>
+      <div className="section-label">Network Inventory</div>
+      {!loading && <NetworkCompositionChart buildings={buildings || []} />}
+
       {/* buildings */}
       <div className="section-label">Buildings</div>
       {loading ? (

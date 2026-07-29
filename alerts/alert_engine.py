@@ -1,3 +1,26 @@
+"""
+alert_engine.py
+------------------
+Consumes ensemble_detector.score_window()'s output and turns it into
+persisted alerts (via alert_store.AlertStore), applying:
+
+  - severity thresholds (risk_scoring.score_to_severity)
+  - issue type classification (risk_scoring.classify_issue_type)
+  - device metadata enrichment (building, name from config.yaml)
+  - deduplication: a persisting anomaly updates one OPEN alert across
+    consecutive windows rather than creating a new alert every minute
+  - automatic closing: when a previously-anomalous (detector, entity_id)
+    drops back below threshold, its OPEN alert is closed
+
+Also computes per-device health scores (must_add_to_project.txt item 3)
+from the same per-window scores, written to a small rolling store so the
+dashboard can show current health without re-scanning all alerts.
+
+Called once per 1-minute window by stream_router.py:
+
+    scores_df = score_window(netflow_df, snmp_df, models)
+    engine.process_window(scores_df)
+"""
 
 import json
 import sys
@@ -23,7 +46,10 @@ import logging
 log = logging.getLogger(__name__)
 
 
-
+# Severity must be at least this to create/extend an alert. Rows scoring
+# below this (severity == DEFAULT_SEVERITY, i.e. "info") are not alerted on
+# but DO count as "back to normal" for the purposes of closing an existing
+# OPEN alert for that (detector, entity_id).
 MIN_ALERTABLE_SEVERITY = "low"
 
 
@@ -40,17 +66,34 @@ class AlertEngine:
         self.store = AlertStore(Path(alerts_dir))
         self.health_path = self.cfg["paths"]["models_dir"].parent / "health_scores.json"
 
-    
+    # -----------------------------------------------------------------
     # Device metadata enrichment
+    # -----------------------------------------------------------------
     def _device_meta(self, entity_id: str) -> Dict[str, Optional[str]]:
+        """
+        Look up building/name for entity_id from config.yaml's devices
+        list. For portscan, entity_id is often an external/unmanaged IP
+        (the suspected scanner) and won't be found - returns Nones, which
+        is fine; the alert still records entity_id itself.
+        """
         device = get_device_by_ip(self.cfg, entity_id)
         if device:
             return {"building": device.get("building"), "device_name": device.get("name")}
         return {"building": None, "device_name": None}
 
-    
+    # -----------------------------------------------------------------
     # Main entry point
+    # -----------------------------------------------------------------
     def process_window(self, scores_df: pd.DataFrame) -> list:
+        """
+        Process one window's worth of detector scores. Returns the list of
+        alerts that were created or updated this call (for logging /
+        immediate notification - the dashboard reads via AlertStore
+        directly for historical queries).
+
+        Rows with NaN anomaly_score (no model loaded) are skipped entirely -
+        neither alerting nor closing happens based on "no opinion" rows.
+        """
         touched_alerts = []
 
         for _, row in scores_df.iterrows():
@@ -103,9 +146,35 @@ class AlertEngine:
         self._update_health_scores(scores_df)
         return touched_alerts
 
-    
-    # Health scores (must_add_to_project.txt - number 3)
+
+    def close_stale_alerts(self, current_window: float, stale_after_windows: int = 2) -> list:
+        """Close OPEN alerts that have not appeared in recent scored windows.
+
+        Some detectors, especially port-scan detection, produce no row at all
+        after the source stops sending traffic. Without a stale timeout those
+        alerts remain open forever because there is no later low score to close
+        them.
+        """
+        cutoff = float(current_window) - max(1, int(stale_after_windows)) * 60
+        closed = []
+        for alert in self.store.list_open_alerts():
+            if float(alert.get("last_window", 0)) < cutoff:
+                closed.append(self.store.close_alert(alert))
+        return closed
+
+    # -----------------------------------------------------------------
+    # Health scores (must_add_to_project.txt item 3)
+    # -----------------------------------------------------------------
     def _update_health_scores(self, scores_df: pd.DataFrame) -> None:
+        """
+        Compute a 0-100 health score per device from this window's scores
+        across all four detectors and persist to health_scores.json.
+
+        Only device-keyed detectors (bandwidth, device_behavior, protocol)
+        contribute - portscan's entity_id is the suspected scanner's IP,
+        which usually isn't one of our managed devices and would pollute
+        per-device health with an unrelated entity's score.
+        """
         device_keyed = scores_df[scores_df["detector"] != "portscan"]
         if device_keyed.empty:
             return
@@ -146,6 +215,17 @@ class AlertEngine:
             return json.load(f)
 
     def compute_health_scores(self, scores_df: pd.DataFrame) -> Dict[str, float]:
+        """
+        Pure variant of _update_health_scores: given a scores_df (as
+        produced by score_window, possibly for an arbitrary/ad-hoc window
+        rather than "the latest"), return {entity_id: health_score} without
+        reading or writing health_scores.json.
+
+        Useful for one-off queries (e.g. "what would this device's health
+        score have been during this historical window") without disturbing
+        the persisted "current" health state that _update_health_scores
+        maintains.
+        """
         device_keyed = scores_df[scores_df["detector"] != "portscan"]
         if device_keyed.empty:
             return {}
@@ -156,13 +236,31 @@ class AlertEngine:
             result[entity_id] = compute_health_score(detector_scores)
         return result
 
-    
-    # Issue distribution view (must_add_to_project.txt - number 5)
+    # -----------------------------------------------------------------
+    # Issue distribution view (must_add_to_project.txt item 5)
+    # -----------------------------------------------------------------
     def issue_distribution(
         self,
         since: Optional[float] = None,
         until: Optional[float] = None,
     ) -> list:
+        """
+        "Issue distribution view allows administrators to view the number
+        of issues on different devices ... This helps administrators
+        quickly focus on the affected devices and the time range when many
+        issues occur." (must_add_to_project.txt item 5)
+
+        Returns one summary dict per entity_id with alerts in the given
+        time range (filtered on created_at):
+            {
+              "entity_id": ...,
+              "building": ...,
+              "device_name": ...,
+              "issue_count": <int>,
+              "max_severity": "info".."critical",
+              "issue_types": [<unique issue_type strings>],
+            }
+        """
         alerts = self.store.list_alerts(since=since, until=until)
         if not alerts:
             return []

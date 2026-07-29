@@ -1,3 +1,50 @@
+"""
+prtg_collector.py
+------------------
+Pulls interface traffic, CPU, memory, and error-rate data from PRTG's REST
+API and writes it in the exact schema that unified_preprocessing.py's
+_load_snmp() expects:
+
+    timestamp, device_ip, if_in_octets, if_out_octets, if_speed,
+    if_in_errors, cpu_load_pct, mem_used_pct
+
+This is the contract that lets _load_snmp() (and therefore
+BandwidthFeatures / DeviceBehaviorFeatures) stay completely unaware of
+whether the data came from raw SNMP polling or PRTG - prtg_collector.py
+is the only place that translates between PRTG's world and ours.
+
+Output:
+    data/raw/prtg_raw_<YYYY-MM-DD>.csv  (daily-rotated, same convention as
+    netflow_collector.py's RotatingCsvWriter)
+
+PRTG sensor model:
+    Each device in config.yaml lists PRTG sensor IDs for:
+      traffic_in, traffic_out  - interface octet counters (bps channels)
+      if_speed_bps             - nominal interface speed (static, from config
+                                  - PRTG traffic sensors don't reliably expose
+                                  this as a queryable channel)
+      if_errors                - error/discard counter sensor
+      cpu, memory               - utilization % sensors
+
+    Any sensor a device doesn't have is simply omitted from config.yaml;
+    the corresponding output column is filled with 0 for that device.
+
+Two modes:
+    poll      - continuous loop, polling every `poll_interval_sec` for the
+                most recent data (Phase 1/2/3 of the orchestrator lifecycle)
+    backfill  - one-shot pull of a historical date range, useful for
+                bootstrapping observation data faster than waiting in real
+                time if PRTG already has weeks of history for these sensors
+
+Usage
+-----
+# Live polling (blocks until Ctrl-C)
+python prtg_collector.py --mode poll
+
+# Backfill the last 14 days in one shot
+python prtg_collector.py --mode backfill --days 14
+"""
+
 import argparse
 import csv
 import logging
@@ -28,7 +75,11 @@ CSV_FIELDS = [
 PRTG_DATE_FMT = "%Y-%m-%d-%H-%M-%S"
 
 
+# ---------------------------------------------------------------------------
+# Output writer - daily-rotated CSV, same convention as netflow_collector.py
+# ---------------------------------------------------------------------------
 class RotatingCsvWriter:
+    """Append-safe, daily-rotated CSV writer (mirrors netflow_collector.py)."""
 
     def __init__(self, output_dir: Path, prefix: str = "prtg_raw"):
         self.output_dir = output_dir
@@ -56,7 +107,7 @@ class RotatingCsvWriter:
     def write_rows(self, rows: List[dict]) -> None:
         if not rows:
             return
-        # Group by day in case a backfill batch takes multiple days
+        # Group by day in case a backfill batch spans multiple days
         by_day: Dict[str, List[dict]] = {}
         for row in rows:
             dt = datetime.fromtimestamp(row["timestamp"], tz=timezone.utc)
@@ -73,8 +124,20 @@ class RotatingCsvWriter:
                     writer.writerow(row)
 
 
-
+# ---------------------------------------------------------------------------
+# PRTG API client
+# ---------------------------------------------------------------------------
 class PrtgClient:
+    """
+    Thin wrapper around PRTG's historicdata.json endpoint.
+
+    PRTG returns one JSON object per averaging interval, with each sensor
+    channel as a key (e.g. "Traffic In (speed)", "CPU Load"). The exact
+    channel names depend on the sensor type and PRTG's localization, so
+    we read channel values positionally where possible and fall back to
+    summing/parsing the "value_raw" fields PRTG provides alongside the
+    formatted strings.
+    """
 
     def __init__(self, base_url: str, api_token: str, timeout: int = 30):
         self.base_url = base_url.rstrip("/")
@@ -91,6 +154,7 @@ class PrtgClient:
     ) -> List[dict]:
         """
         Fetch historic data for a sensor between start/end (UTC datetimes).
+        Returns a list of {"datetime": ..., "value_raw": <dict of channel -> float>}.
         """
         url = f"{self.base_url}/api/historicdata.json"
         params = {
@@ -113,7 +177,12 @@ class PrtgClient:
 
 
 def _to_epoch(prtg_datetime_str: str) -> Optional[float]:
-
+    """
+    PRTG returns datetimes like "06/13/2026 14:00:00" (locale-dependent) or
+    as an ISO-ish string depending on PRTG version/config. We try a couple
+    of common formats and fall back to None (row skipped) if none match -
+    a parsing failure here should never crash the whole poll cycle.
+    """
     for fmt in ("%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
             dt = datetime.strptime(prtg_datetime_str, fmt).replace(tzinfo=timezone.utc)
@@ -125,7 +194,21 @@ def _to_epoch(prtg_datetime_str: str) -> Optional[float]:
 
 
 def _extract_channel_value(point: dict, channel_keys: List[str]) -> Optional[float]:
+    """
+    A single historicdata point looks roughly like:
+        {
+          "datetime": "06/13/2026 14:00:00",
+          "Traffic In": "1.2 Mbit/s",
+          "Traffic In_raw": 1234567.0,
+          "Traffic Out": "...",
+          "Traffic Out_raw": ...,
+          ...
+        }
 
+    channel_keys is a list of candidate "<Name>_raw" keys to try, in order
+    of preference, since PRTG's exact channel naming varies by sensor type
+    and PRTG version/localization. Returns the first match found, or None.
+    """
     for key in channel_keys:
         raw_key = f"{key}_raw"
         if raw_key in point:
@@ -136,7 +219,9 @@ def _extract_channel_value(point: dict, channel_keys: List[str]) -> Optional[flo
     return None
 
 
-
+# Candidate PRTG channel name prefixes per metric, most common first.
+# These cover the standard "SNMP Traffic" and "SNMP CPU Load"/"SNMP Memory"
+# sensor types; if a site uses custom sensor names, add them here.
 CHANNEL_CANDIDATES = {
     "if_in_octets":  ["Traffic In", "Traffic In (Volume)", "In", "ifInOctets"],
     "if_out_octets": ["Traffic Out", "Traffic Out (Volume)", "Out", "ifOutOctets"],
@@ -146,8 +231,9 @@ CHANNEL_CANDIDATES = {
 }
 
 
-
+# ---------------------------------------------------------------------------
 # Per-device polling
+# ---------------------------------------------------------------------------
 def poll_device(
     client: PrtgClient,
     device: dict,
@@ -163,7 +249,7 @@ def poll_device(
     device_ip = device["ip"]
     if_speed = float(sensors.get("if_speed_bps", 0))
 
-    # timestamp - partial row
+    # timestamp -> partial row
     merged: Dict[float, dict] = {}
 
     metric_sensor_map = {
@@ -202,8 +288,9 @@ def poll_device(
     return list(merged.values())
 
 
-
+# ---------------------------------------------------------------------------
 # Poll mode (continuous)
+# ---------------------------------------------------------------------------
 def run_poll(cfg: dict, output_dir: Path) -> None:
     prtg_cfg = cfg["prtg"]
     client = PrtgClient(prtg_cfg["base_url"], prtg_cfg["api_token"])
@@ -246,10 +333,20 @@ def run_poll(cfg: dict, output_dir: Path) -> None:
         log.info("Shutting down. Total rows collected: %d", total_rows)
 
 
-
+# ---------------------------------------------------------------------------
 # Backfill mode (one-shot historical pull)
+# ---------------------------------------------------------------------------
 def run_backfill(cfg: dict, output_dir: Path, days: int, chunk_hours: int = 24) -> None:
+    """
+    Pull `days` worth of history for every device, in chunk_hours-sized
+    requests (PRTG limits how much historic data can be requested per call
+    for finely-averaged data, so we chunk by day by default).
 
+    This is the fast path for bootstrapping observation data: if PRTG
+    already has 30 days of 60s-averaged data sitting in its database, you
+    don't need to wait 14 real-time days for the orchestrator's observation
+    phase to gather enough data - backfill it in one run.
+    """
     prtg_cfg = cfg["prtg"]
     client = PrtgClient(prtg_cfg["base_url"], prtg_cfg["api_token"])
     devices = cfg["devices"]
@@ -288,8 +385,9 @@ def run_backfill(cfg: dict, output_dir: Path, days: int, chunk_hours: int = 24) 
     log.info("Backfill complete. Total rows: %d", total_rows)
 
 
-
+# ---------------------------------------------------------------------------
 # CLI
+# ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="PRTG collector (poll or backfill)")
     parser.add_argument("--mode", choices=["poll", "backfill"], required=True)

@@ -1,3 +1,35 @@
+"""
+train_protocol_model.py
+-------------------------
+Trains the Suspicious Protocol Usage Detector model, and produces
+data/processed/protocol_baseline.csv - the per-device "expected protocol
+mix" that ProtocolFeatures uses to compute kl_div_from_baseline and
+num_new_protocols (see unified_preprocessing.ProtocolFeatures and
+_load_baseline).
+
+Bootstrapping order (handles the chicken-and-egg of "baseline needed to
+compute features, features needed to compute baseline"):
+
+  1. On the FIRST run, protocol_baseline.csv doesn't exist yet.
+     _load_baseline() returns {} (Issue #6 fix), so ProtocolFeatures
+     computes kl_div_from_baseline=0 and num_new_protocols=0 for every
+     row - i.e. "everything looks like baseline" for this one run only.
+     The training data's protocol distribution itself becomes the new
+     baseline, written out at the end of this run.
+
+  2. On SUBSEQUENT runs (retraining), the previous protocol_baseline.csv
+     is loaded first, features are computed against it (so KL divergence
+     reflects real drift since last training), the model is retrained, and
+     then the baseline is refreshed from the current training window.
+
+This means protocol_baseline.csv always reflects "the protocol mix as of
+the last training run" - which is exactly the comparison point live
+inference should use until the next retrain.
+
+Usage:
+    python training/train_protocol_model.py
+"""
+
 import argparse
 import sys
 from pathlib import Path
@@ -30,7 +62,8 @@ log = logging.getLogger(__name__)
 def compute_protocol_baseline(nf: pd.DataFrame) -> pd.DataFrame:
     """
     Compute each device's overall protocol distribution (tcp/udp/icmp ratio)
-    across the full training period.
+    across the full training period. Returns a DataFrame with columns
+    [device_ip, protocol, ratio] - the schema _load_baseline() expects.
     """
     nf = _assign_window(nf, 60)
     nf = _assign_device_ip(nf)
@@ -71,7 +104,7 @@ def main():
     else:
         log.info("No existing baseline (first run) - kl_div/num_new_protocols will be 0 for this training pass")
 
-    # Compute features using whatever baseline currently exists
+    # Compute features using whatever baseline currently exists (possibly none)
     feat = ProtocolFeatures.from_csv(
         netflow_path,
         baseline_csv=str(baseline_path) if baseline_path.exists() else None,
@@ -116,7 +149,10 @@ def main():
             len(eval_df), eval_scores.mean(), eval_scores.min(), eval_scores.max(),
         )
 
-
+    # Refresh the baseline FROM THIS TRAINING WINDOW for next time.
+    # Done last and deliberately overwrites the (possibly-empty) baseline
+    # used above - "the baseline as of this training run" becomes the
+    # comparison point for live inference until the next retrain.
     new_baseline = compute_protocol_baseline(nf_raw)
     new_baseline.to_csv(baseline_path, index=False)
     log.info("Refreshed protocol baseline -> %s (%d device/protocol rows)", baseline_path, len(new_baseline))

@@ -1,4 +1,6 @@
 """
+api/routes_system.py
+-----------------------
 System lifecycle status for the dashboard's status banner:
 "Collecting baseline data (Day 4 of 14)" / "Training models..." /
 "Live detection active".
@@ -17,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 
 from orchestrator.orchestrator import SystemOrchestrator
-from orchestrator.system_state import PHASE_TRAINING
+from orchestrator.system_state import PHASE_OBSERVATION, PHASE_TRAINING
 from api.security import audit_event, require_admin
 
 router = APIRouter()
@@ -50,13 +52,15 @@ def get_status():
         "last_training_result": state.get("last_training_result"),
     }
 
-    if state["phase"] != PHASE_TRAINING:
+    if state["phase"] == PHASE_OBSERVATION:
         try:
             result["observation"] = orch.observation_status()
         except Exception:
-            # observation_status reads NetFlow data; if data/raw is empty
-            # or unreadable this shouldn't break the status endpoint.
             result["observation"] = None
+    else:
+        # Preserve the response shape without rescanning telemetry after the
+        # system has already entered inference/training.
+        result["observation"] = None
 
     return result
 

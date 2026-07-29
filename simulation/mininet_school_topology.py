@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+mininet_school_topology.py
+--------------------------
 Python 3.5-compatible Mininet topology for the school-network simulation.
 
 This version intentionally uses canonical Mininet switch names (s1, s2, ...)
@@ -20,6 +22,7 @@ Host mapping:
   h4 = branch-server   10.0.2.21/24
   h5 = web-server      10.0.3.10/24
   h6 = dns-server      10.0.3.53/24
+  h7 = ap-library      10.0.1.21/24, 10.255.0.31/24 (onboarding demo AP)
   h0 = root namespace management interface, 10.255.0.254/24
 
 Typical use inside the Mininet VM:
@@ -110,6 +113,10 @@ def build_network():
     h4 = net.addHost("h4", ip="10.0.2.21/24", defaultRoute="via 10.0.2.1")
     h5 = net.addHost("h5", ip="10.0.3.10/24", defaultRoute="via 10.0.3.1")
     h6 = net.addHost("h6", ip="10.0.3.53/24", defaultRoute="via 10.0.3.1")
+    # Factory-default/simulated access point used for ZTP-lite onboarding demo.
+    # It is intentionally not written to the generated monitoring config until
+    # approved through the dashboard onboarding workflow.
+    h7 = net.addHost("h7", ip="10.0.1.21/24", defaultRoute="via 10.0.1.1")
 
     info("*** Adding data-plane links\n")
     net.addLink(r1, s1, intfName1="r1-hq", bw=100)
@@ -125,6 +132,7 @@ def build_network():
     net.addLink(h4, s2, intfName1="h4-eth0", bw=100)
     net.addLink(h5, s3, intfName1="h5-eth0", bw=100)
     net.addLink(h6, s3, intfName1="h6-eth0", bw=100)
+    net.addLink(h7, s1, intfName1="h7-eth0", bw=100)
 
     info("*** Adding SNMP management network links\n")
     net.addLink(r1, s5, intfName1="r1-mgmt", bw=100)
@@ -132,6 +140,7 @@ def build_network():
     net.addLink(h4, s5, intfName1="h4-mgmt", bw=100)
     net.addLink(h5, s5, intfName1="h5-mgmt", bw=100)
     net.addLink(h6, s5, intfName1="h6-mgmt", bw=100)
+    net.addLink(h7, s5, intfName1="h7-mgmt", bw=100)
 
     # Root namespace node so the Mininet VM itself can poll 10.255.0.0/24.
     h0 = net.addHost("h0", inNamespace=False, ip="10.255.0.254/24")
@@ -157,6 +166,7 @@ def configure_ips_and_routes(net):
     net.get("h4").cmd("ip addr add 10.255.0.21/24 dev h4-mgmt")
     net.get("h5").cmd("ip addr add 10.255.0.10/24 dev h5-mgmt")
     net.get("h6").cmd("ip addr add 10.255.0.53/24 dev h6-mgmt")
+    net.get("h7").cmd("ip addr add 10.255.0.31/24 dev h7-mgmt")
 
     net.get("h0").cmd("ip addr flush dev h0-mgmt && ip addr add 10.255.0.254/24 dev h0-mgmt")
     net.get("h0").cmd("ip link set h0-mgmt up")
@@ -202,7 +212,7 @@ def _write_snmpd_config(node, community, location):
 
 def start_snmp_agents(net, community="public"):
     info("*** Starting snmpd inside monitored namespaces\n")
-    for name in ["r1", "r2", "h4", "h5", "h6"]:
+    for name in ["r1", "r2", "h4", "h5", "h6", "h7"]:
         node = net.get(name)
         node.cmd("pkill -f 'snmpd.*{0}-snmpd.conf' || true".format(name))
         conf_path = _write_snmpd_config(node, community, "Mininet {0}".format(name))
@@ -216,12 +226,14 @@ def start_demo_services(net):
     web = net.get("h5")
     branch_server = net.get("h4")
     dns = net.get("h6")
+    ap = net.get("h7")
 
     web.cmd("mkdir -p /tmp/web-demo && echo 'Mininet school demo web server' > /tmp/web-demo/index.html")
     web.cmd("cd /tmp/web-demo && python3 -m http.server 80 >/tmp/web-server-http.log 2>&1 &")
     web.cmd("iperf -s >/tmp/web-server-iperf.log 2>&1 &")
     branch_server.cmd("iperf -s >/tmp/branch-server-iperf.log 2>&1 &")
     dns.cmd("python3 -m http.server 8053 >/tmp/dns-server-http.log 2>&1 &")
+    ap.cmd("python3 -m http.server 8080 >/tmp/ap-library-http.log 2>&1 &")
 
 
 def _ifindex(node, intf):
@@ -312,6 +324,19 @@ def write_generated_config(net, path, community="public"):
             "models_dir": "data/models",
             "alerts_dir": "data/alerts",
         },
+        "topology": {
+            "links": [
+                {"source": "hq-core-router-r1", "target": "branch-router-r2", "type": "wan", "interface": "r1-r2"},
+                {"source": "hq-core-router-r1", "target": "web-server", "type": "dmz", "interface": "r1-dmz"},
+                {"source": "hq-core-router-r1", "target": "dns-server", "type": "dmz", "interface": "r1-dmz"},
+                {"source": "branch-router-r2", "target": "branch-server", "type": "lan", "interface": "r2-branch"},
+            ]
+        },
+        "troubleshooting": {
+            "syslog_events_file": "data/syslogs/syslog_events.jsonl",
+            "default_analysis_window_hours": 24,
+            "incident_confidence_threshold": 40,
+        },
     }
     with open(str(path), "w") as handle:
         # PyYAML 3.11 on Ubuntu Xenial does not support sort_keys=.
@@ -322,15 +347,21 @@ def write_generated_config(net, path, community="public"):
 def print_demo_help(config_out, netflow_target):
     info("\n*** Simulation ready\n")
     info("*** Node names used in the Mininet CLI:\n")
-    info("    h1=finance-pc, h2=staff-pc, h3=branch-pc, h4=branch-server, h5=web-server, h6=dns-server\n")
+    info("    h1=finance-pc, h2=staff-pc, h3=branch-pc, h4=branch-server, h5=web-server, h6=dns-server, h7=ap-library\n")
     info("*** Useful commands from inside the Mininet CLI:\n")
     info("    h1 ping -c 3 10.0.3.10\n")
     info("    h2 curl http://10.0.3.10/\n")
     info("    h1 iperf -c 10.0.3.10 -t 30\n")
     info("    h2 nmap -p 1-200 10.0.3.10\n")
     info("    h1 iperf -u -c 10.0.3.10 -p 53 -b 5M -t 30\n")
+    info("    h7 ping -c 3 10.0.3.10\n")
     info("\n*** In another Mininet VM terminal, run SNMP-backed PRTG emulation:\n")
     info("    python3 collectors/snmp_prtg_collector.py --mode poll --config {0} --backend cli\n".format(config_out))
+    info("\n*** ZTP-lite onboarding demo device:\n")
+    info("    h7 is a simulated factory-default access point: serial AP-LIB-001, mgmt 10.255.0.31, data 10.0.1.21\n")
+    info("    From the Mininet VM shell, run the phone-home agent with your host/controller IP, for example:\n")
+    info("    python3 simulation/ztp_device_agent.py --controller http://192.168.23.1:8000 --serial AP-LIB-001 --mac 02:00:00:00:07:00 --device-type access_point --model Simulated-AP --management-ip 10.255.0.31 --data-ip 10.0.1.21\n")
+
     if netflow_target:
         info("\n*** On the host OS, receive NetFlow from OVS:\n")
         info("    python collectors/netflow_collector.py --mode udp --host 0.0.0.0 --port 2055\n")

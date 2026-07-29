@@ -1,3 +1,36 @@
+"""
+netflow_collector.py
+--------------------
+Collects NetFlow v5/v9 records from either:
+  - A live UDP socket (devices export to this host)
+  - A .pcap file (offline / training data capture)
+
+Output modes:
+  - CSV  (default): appends rows to data/raw/netflow_raw_<YYYY-MM-DD>.csv
+                     Files are rotated daily so training reads/deletes are cheap
+                     and the 90-day rolling retraining window can simply drop
+                     old daily files.
+  - Kafka (--publish-kafka): in addition to (or instead of) CSV, publish each
+                     flow record as JSON to the configured Kafka topic for
+                     live inference (Phase 3 of the orchestrator lifecycle).
+
+NetFlow v9 template handling:
+  Templates are cached per-exporter (keyed by the source IP that sent the
+  UDP packet), because different routers/switches commonly reuse the same
+  template_id for different field layouts. See packet_utils.py.
+
+Usage
+-----
+# Live mode, CSV only (Phase 1/2 - observation & training)
+python netflow_collector.py --mode udp --host 0.0.0.0 --port 2055
+
+# Live mode, CSV + Kafka (Phase 3 - inference, run alongside CSV collection)
+python netflow_collector.py --mode udp --publish-kafka --kafka-topic netflow-raw
+
+# Pcap mode (processes file then exits) - for synthetic/test data
+python netflow_collector.py --mode pcap --file captures/traffic.pcap
+"""
+
 import argparse
 import csv
 import json
@@ -17,8 +50,9 @@ from collectors.packet_utils import (
     parse_pcap_file,
 )
 
-
+# ---------------------------------------------------------------------------
 # Config
+# ---------------------------------------------------------------------------
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 2055
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
@@ -38,10 +72,18 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-
+# ---------------------------------------------------------------------------
 # Writer - daily-rotated, append-safe CSV
+# ---------------------------------------------------------------------------
 class RotatingCsvWriter:
+    """
+    Append-safe CSV writer that rotates to a new file each UTC day.
 
+    File naming: <prefix>_<YYYY-MM-DD>.csv inside output_dir.
+    This keeps any single file from growing unbounded over weeks/months
+    of continuous collection, and lets old days be deleted independently
+    (e.g. by a 90-day retention job) without touching today's file.
+    """
 
     def __init__(self, output_dir: Path, prefix: str = DEFAULT_FILE_PREFIX):
         self.output_dir = output_dir
@@ -70,7 +112,8 @@ class RotatingCsvWriter:
     def write_records(self, records: list) -> None:
         if not records:
             return
-        # Use the timestamp of the first record to decide the file for this batch
+        # Use the timestamp of the first record to decide the file for this batch.
+        # Within a 60s collector loop this is always within one day in practice.
         path = self._ensure_current_file(records[0].timestamp)
         with open(path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
@@ -82,9 +125,16 @@ class RotatingCsvWriter:
                     writer.writerow(rec.to_csv_row())
 
 
-
+# ---------------------------------------------------------------------------
 # Optional Kafka publisher (Phase 3 - live inference)
+# ---------------------------------------------------------------------------
 class KafkaFlowPublisher:
+    """
+    Thin wrapper around kafka-python's producer. Only imported/instantiated
+    when --publish-kafka is passed, so CSV-only training environments don't
+    need the kafka-python dependency installed at all.
+    """
+
     def __init__(self, bootstrap_servers: str, topic: str):
         from kafka import KafkaProducer  # local import: optional dependency
 
@@ -109,7 +159,9 @@ class KafkaFlowPublisher:
         self.producer.close()
 
 
+# ---------------------------------------------------------------------------
 # UDP socket mode
+# ---------------------------------------------------------------------------
 def run_udp(
     host: str,
     port: int,
@@ -165,8 +217,9 @@ def run_udp(
             kafka_publisher.close()
 
 
-
+# ---------------------------------------------------------------------------
 # pcap mode
+# ---------------------------------------------------------------------------
 def run_pcap(pcap_file: str, output_dir: Path) -> None:
     if not os.path.exists(pcap_file):
         log.error("pcap file not found: %s", pcap_file)
@@ -194,8 +247,9 @@ def run_pcap(pcap_file: str, output_dir: Path) -> None:
     log.info("Done. Total flows written: %d", total)
 
 
-
+# ---------------------------------------------------------------------------
 # CLI
+# ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="NetFlow collector (UDP or pcap)")
     parser.add_argument(

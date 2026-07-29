@@ -1,3 +1,36 @@
+"""
+stream_router.py
+-------------------
+The Phase 3 (live inference) main loop. Consumes from the Kafka topics
+that netflow_collector.py and prtg_collector.py publish to
+(--publish-kafka mode), buckets records into 60-second windows via
+SlidingWindowBuffer, and for each completed window:
+
+    netflow_df, snmp_df  --[ensemble_detector.score_window]--> scores_df
+                         --[AlertEngine.process_window]--> alerts/health updated
+
+This is the piece that "closes the loop" in the live system: the same
+unified_preprocessing feature code, the same trained models, and the same
+alert engine used elsewhere, now driven by a continuous Kafka stream
+instead of CSVs.
+
+Model reloading:
+    ModelBundle is loaded once at startup. Each iteration, this module
+    checks data/models/system_state.json's "models_version" - if it has
+    increased since the last check (the orchestrator promoted new models
+    via a retrain), ModelBundle.reload() is called to pick up the new
+    model files. This means stream_router does NOT need to be restarted
+    after a retrain.
+
+Kafka is an optional dependency (kafka-python) - if it's not installed,
+this module can still be imported (e.g. for testing process_one_window in
+isolation) but main()/run() will raise a clear error if invoked.
+
+Usage:
+    python ingestion/stream_router.py
+    python ingestion/stream_router.py --config path/to/config.yaml
+"""
+
 import argparse
 import sys
 import time
@@ -19,7 +52,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [stream-router] %(le
 log = logging.getLogger(__name__)
 
 
-
+# NetFlow record schema (matches collectors.packet_utils.NetFlowRecord.to_csv_row
+# and netflow_collector.py's CSV_FIELDS / KafkaFlowPublisher payloads).
 NETFLOW_COLUMNS = [
     "timestamp", "src_ip", "dst_ip", "src_port", "dst_port",
     "protocol", "tcp_flags", "packets", "bytes", "duration_sec",
@@ -43,7 +77,11 @@ def _records_to_df(records: list, columns: list) -> pd.DataFrame:
 
 
 class StreamRouter:
-
+    """
+    Holds the buffers, model bundle, and alert engine for one running
+    instance. process_one_window() is the unit of work, separated from the
+    Kafka consume loop so it can be tested without Kafka.
+    """
 
     def __init__(self, config_path: Optional[str] = None):
         self.cfg = load_config(config_path)
@@ -57,8 +95,9 @@ class StreamRouter:
         self.system_state = SystemState(self.cfg["paths"]["models_dir"] / "system_state.json")
         self._last_models_version = self.system_state.get().get("models_version", 0)
 
-    
-    # Model hot reload
+    # -----------------------------------------------------------------
+    # Model hot-reload
+    # -----------------------------------------------------------------
     def _maybe_reload_models(self) -> None:
         current_version = self.system_state.get().get("models_version", 0)
         if current_version != self._last_models_version:
@@ -69,10 +108,18 @@ class StreamRouter:
             self.models = self.models.reload()
             self._last_models_version = current_version
 
-    
+    # -----------------------------------------------------------------
     # Per-window processing (testable without Kafka)
+    # -----------------------------------------------------------------
     def process_one_window(self, window: int, netflow_records: list, snmp_records: list) -> pd.DataFrame:
+        """
+        Process one completed window's worth of records:
+          1. Build netflow_df / snmp_df
+          2. score_window via the (possibly just-reloaded) model bundle
+          3. AlertEngine.process_window - updates alerts + health scores
 
+        Returns the scores_df for logging/inspection.
+        """
         self._maybe_reload_models()
 
         netflow_df = _records_to_df(netflow_records, NETFLOW_COLUMNS)
@@ -92,18 +139,30 @@ class StreamRouter:
         )
         return scores_df
 
-    
+    # -----------------------------------------------------------------
     # Buffer intake
+    # -----------------------------------------------------------------
     def ingest_netflow(self, record: dict) -> None:
         self.netflow_buffer.add(record)
 
     def ingest_prtg(self, record: dict) -> None:
         self.prtg_buffer.add(record)
 
-    
+    # -----------------------------------------------------------------
     # Tick: flush any ready windows from both buffers
+    # -----------------------------------------------------------------
     def tick(self) -> int:
+        """
+        Flush ready windows from both buffers and process each. NetFlow and
+        PRTG windows are matched by window_start; if one stream has a ready
+        window the other doesn't yet, the other's records for that window
+        (if any arrive later) are effectively dropped for that window - in
+        practice both streams should be on the same 60s cadence so this is
+        rare, and an empty snmp_df for a window degrades gracefully (see
+        unified_preprocessing's "no SNMP data" fallback paths).
 
+        Returns the number of windows processed.
+        """
         netflow_ready = dict(self.netflow_buffer.flush_ready())
         prtg_ready = dict(self.prtg_buffer.flush_ready())
 
@@ -117,14 +176,16 @@ class StreamRouter:
         return len(all_windows)
 
 
-
+# ---------------------------------------------------------------------------
 # Kafka consume loop (optional dependency)
+# ---------------------------------------------------------------------------
 def run(config_path: Optional[str] = None, poll_timeout_ms: int = 1000) -> None:
     try:
         from kafka import KafkaConsumer
     except ImportError:
         raise RuntimeError(
             "kafka-python is required to run stream_router's live consume loop. "
+            "Install with: pip install kafka-python --break-system-packages"
         )
 
     router = StreamRouter(config_path)

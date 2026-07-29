@@ -1,3 +1,54 @@
+"""
+orchestrator.py
+-----------------
+The lifecycle manager described in the project design:
+
+    OBSERVATION -> TRAINING -> INFERENCE
+                       ^             |
+                       |__retraining_|
+
+Responsibilities:
+  1. On startup, determine the current phase from system_state.json
+     (or initialize it if this is a fresh deployment).
+  2. While in OBSERVATION: periodically check whether enough data has been
+     collected (config.yaml's bootstrap.* thresholds) to start training.
+  3. Trigger the training pipeline (TRAINING phase):
+       a. Run the four train_*.py scripts as subprocesses (CSV-only, no
+          Kafka - matches the training/inference separation throughout
+          this project)
+       b. Run evaluate_models.py as a gate
+       c. On pass: archive the previously-deployed models, promote the
+          new ones (they're already in data/models/ - "promotion" here
+          means the archive step + bumping models_version), transition
+          to INFERENCE
+       d. On fail: leave the previous models in place (do NOT overwrite
+          them - see _archive_and_train), transition back to INFERENCE
+          (if models existed before) or OBSERVATION (first-ever run),
+          and record the failure for admin review
+  4. While in INFERENCE: periodically check whether a retrain is due
+     (config.yaml's bootstrap.retrain_interval_days), and if so repeat
+     step 3.
+
+This module exposes both:
+  - A class-based API (SystemOrchestrator) for use by scheduler.py / the
+    FastAPI app (routes_system.py can call trigger_training_now() for an
+    admin-requested manual retrain, or train_device_baseline() for
+    must_add_to_project.txt item 6).
+  - A `run_once()` convenience function and CLI entry point for use from
+    cron/systemd timers instead of an in-process scheduler, if preferred.
+
+IMPORTANT ON MODEL PROMOTION:
+The train_*.py scripts write directly into data/models/*.pkl. This means
+by the time evaluate_models.py runs, the "new" models have already
+overwritten the "old" ones on disk. To make rollback possible on
+evaluation failure, _archive_current_models() copies the CURRENT models to
+data/models/archive/<timestamp>/ BEFORE running training. If evaluation
+fails, the archived copies are copied back over the freshly-trained
+(failing) ones - this is the rollback. If evaluation passes, the archived
+copies are just left in data/models/archive/ as history (and old archives
+beyond a retention count are pruned).
+"""
+
 import shutil
 import subprocess
 import sys
@@ -9,7 +60,7 @@ from typing import List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from orchestrator.system_state import SystemState, PHASE_OBSERVATION, PHASE_INFERENCE, PHASE_TRAINING
-from preprocessing.unified_preprocessing import _load_netflow
+from utils.telemetry_cache import count_rotating_csv_rows
 from utils.config_loader import load_config
 
 import logging
@@ -19,6 +70,10 @@ log = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# Training scripts run in this order. device_model and protocol_model are
+# independent of each other and of bandwidth/portscan, but running them
+# sequentially keeps subprocess output easy to follow and avoids four
+# processes hammering the same CSV files concurrently during read.
 TRAIN_SCRIPTS = [
     "training/train_bandwidth_model.py",
     "training/train_portscan_model.py",
@@ -27,7 +82,10 @@ TRAIN_SCRIPTS = [
 ]
 EVALUATE_SCRIPT = "training/evaluate_models.py"
 
-# Model files that get archived/restored as a unit on each training cycle
+# Model files that get archived/restored as a unit on each training cycle.
+# device_profiles/ (per-device baselines) and normalization_stats.json are
+# included so a rollback restores the complete picture, not just the four
+# global models.
 MODEL_ARTIFACTS = [
     "bandwidth_model.pkl",
     "portscan_model.pkl",
@@ -36,20 +94,36 @@ MODEL_ARTIFACTS = [
     "normalization_stats.json",
 ]
 
-ARCHIVE_RETENTION = 10  # training snapshots
+ARCHIVE_RETENTION = 10  # keep at most this many archived training snapshots
 
 
 class SystemOrchestrator:
     def __init__(self, config_path: Optional[str] = None):
         self.cfg = load_config(config_path)
+        # Use the resolved path (not the possibly-None argument) so
+        # subprocesses spawned by _run_subprocess always get an explicit
+        # --config pointing at the same config.yaml this process read -
+        # even if config_path was None and DEFAULT_CONFIG_PATH was
+        # monkeypatched (e.g. in tests).
         self.config_path = self.cfg["_config_path"]
         self.models_dir: Path = self.cfg["paths"]["models_dir"]
         self.netflow_dir: Path = self.cfg["paths"]["netflow_raw_dir"]
         self.state = SystemState(self.models_dir / "system_state.json")
 
-    
+    # -----------------------------------------------------------------
     # Observation phase
+    # -----------------------------------------------------------------
     def observation_status(self) -> dict:
+        """
+        Returns a dict describing progress towards leaving observation:
+            {
+              "ready": bool,
+              "days_elapsed": float,
+              "days_required": int,
+              "netflow_records": int,
+              "records_required": int,
+            }
+        """
         bootstrap = self.cfg["bootstrap"]
         state = self.state.get()
 
@@ -57,8 +131,7 @@ class SystemOrchestrator:
         days_elapsed = (time.time() - started) / 86400.0
         days_required = bootstrap["min_collection_days"]
 
-        nf = _load_netflow(str(self.netflow_dir))
-        records = len(nf)
+        records = count_rotating_csv_rows(self.netflow_dir, "netflow_raw_*.csv")
         records_required = bootstrap["min_netflow_records"]
 
         ready = (days_elapsed >= days_required) and (records >= records_required)
@@ -71,9 +144,15 @@ class SystemOrchestrator:
             "records_required": records_required,
         }
 
-    
+    # -----------------------------------------------------------------
     # Main tick - called periodically by scheduler.py
+    # -----------------------------------------------------------------
     def tick(self) -> None:
+        """
+        One scheduler iteration. Decides whether any state transition is
+        needed and acts on it. Safe to call repeatedly (e.g. every few
+        minutes) - it's a no-op most of the time.
+        """
         phase = self.state.phase
 
         if phase == PHASE_OBSERVATION:
@@ -98,6 +177,9 @@ class SystemOrchestrator:
                 self.trigger_training_now()
 
         elif phase == PHASE_TRAINING:
+            # Training is a transient state. If we observe it here, a
+            # previous run likely crashed mid-training without updating
+            # state. Don't get stuck - re-run.
             log.warning("Found system in TRAINING phase on tick - a previous "
                         "run may have crashed. Re-running training.")
             self.trigger_training_now()
@@ -111,9 +193,16 @@ class SystemOrchestrator:
         interval_sec = bootstrap["retrain_interval_days"] * 86400
         return (time.time() - last_retrain) >= interval_sec
 
-    
-    # Training trigger ,also callable directly for manual/admin retrain
+    # -----------------------------------------------------------------
+    # Training trigger (also callable directly for manual/admin retrain)
+    # -----------------------------------------------------------------
     def trigger_training_now(self) -> bool:
+        """
+        Runs the full training pipeline: archive current models, run all
+        four train_*.py scripts, evaluate, and either promote or roll back.
+
+        Returns True if the new models were promoted, False if rolled back.
+        """
         self.state.mark_training_started()
         archive_dir = self._archive_current_models()
 
@@ -151,9 +240,16 @@ class SystemOrchestrator:
             log.error("Training FAILED (%s) - rolled back to previous models.", reason)
             return False
 
-    
+    # -----------------------------------------------------------------
     # Archive / promote / rollback
+    # -----------------------------------------------------------------
     def _archive_current_models(self) -> Path:
+        """
+        Copy the current model artifacts to data/models/archive/<timestamp>/
+        BEFORE training overwrites them. Returns the archive directory
+        (created even if some/all artifacts don't exist yet - e.g. the very
+        first training run, where archive_dir will just be empty).
+        """
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
         archive_dir = self.models_dir / "archive" / timestamp
         archive_dir.mkdir(parents=True, exist_ok=True)
@@ -186,12 +282,24 @@ class SystemOrchestrator:
             shutil.rmtree(old, ignore_errors=True)
 
     def _promote(self, archive_dir: Path) -> None:
+        """
+        New models are already in data/models/ (written there by train_*.py).
+        "Promotion" is just: nothing further to copy - the archive_dir
+        snapshot of the PREVIOUS models remains as history/rollback point.
+        This method exists as an explicit step for clarity and as a hook
+        for future promotion-time actions (e.g. notifying the dashboard,
+        reloading live inference workers).
+        """
         log.info("Promoting newly trained models (previous version archived at %s)", archive_dir)
+        # Hook point: e.g. signal the live inference process to reload
+        # model bundles from disk. Left as a no-op here since the live
+        # inference loader (detectors/ensemble_detector.py) re-reads
+        # model files on each retrain cycle / restart.
 
     def _rollback(self, archive_dir: Path) -> None:
         """
         Restore the previous model artifacts from archive_dir over the
-        freshly trained ones in data/models/.
+        freshly (and failingly) trained ones in data/models/.
         """
         log.info("Rolling back to archived models from %s", archive_dir)
         for artifact in MODEL_ARTIFACTS:
@@ -204,13 +312,17 @@ class SystemOrchestrator:
             profiles_dst = self.models_dir / "device_profiles"
             shutil.copytree(profiles_src, profiles_dst, dirs_exist_ok=True)
 
-    
-    # Per-device baseline (must_add_to_project.txt number 6)
+    # -----------------------------------------------------------------
+    # Per-device baseline (must_add_to_project.txt item 6)
+    # -----------------------------------------------------------------
     def train_device_baseline(self, device_ip: str) -> bool:
         """
         On-request per-device baseline training. Does NOT go through the
         archive/evaluate/promote machinery used for the four global
-        models
+        models - a per-device model is additive (stored under
+        data/models/device_profiles/) and doesn't replace anything that
+        live inference depends on by default, so a bad per-device profile
+        can't break the global system. Returns True on success.
         """
         log.info("Training per-device baseline for %s", device_ip)
         ok = self._run_subprocess(
@@ -223,8 +335,9 @@ class SystemOrchestrator:
             log.error("Per-device baseline training failed for %s", device_ip)
         return ok
 
-    
+    # -----------------------------------------------------------------
     # Subprocess helper
+    # -----------------------------------------------------------------
     def _run_subprocess(self, script: str, extra_args: Optional[List[str]] = None) -> bool:
         cmd = [sys.executable, str(PROJECT_ROOT / script)]
         if self.config_path:
@@ -248,8 +361,9 @@ class SystemOrchestrator:
         return True
 
 
-
+# ---------------------------------------------------------------------------
 # CLI / cron entry point
+# ---------------------------------------------------------------------------
 def run_once(config_path: Optional[str] = None) -> None:
     orchestrator = SystemOrchestrator(config_path)
     orchestrator.tick()

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+snmp_prtg_collector.py
+----------------------
 Python 3.5-compatible SNMP-backed PRTG-style collector for the Mininet
 simulation.
 
@@ -10,6 +12,12 @@ as the real PRTG collector:
     timestamp,device_ip,if_in_octets,if_out_octets,if_speed,
     if_in_errors,cpu_load_pct,mem_used_pct
 
+Typical Mininet usage:
+
+  python3 collectors/snmp_prtg_collector.py \
+    --mode poll \
+    --config simulation/mininet_config.generated.yaml \
+    --backend cli
 
 This file intentionally avoids Python 3.6+ features so it can run on older
 Mininet VMs that ship with Python 3.5.

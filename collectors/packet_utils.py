@@ -1,11 +1,19 @@
+"""
+packet_utils.py
+---------------
+Shared parsing utilities for NetFlow v5/v9 records and pcap packets.
+Used by netflow_collector.py for both UDP socket and pcap modes.
+"""
+
 import struct
 import socket
 from dataclasses import dataclass
 from typing import List, Optional
 
 
-
+# ---------------------------------------------------------------------------
 # NetFlow v5 constants
+# ---------------------------------------------------------------------------
 NF5_HEADER_SIZE = 24   # bytes
 NF5_RECORD_SIZE = 48   # bytes
 
@@ -27,20 +35,21 @@ NF9_FIELD_TYPES = {
 }
 
 
-
+# ---------------------------------------------------------------------------
 # Data structures
+# ---------------------------------------------------------------------------
 @dataclass
 class NetFlowRecord:
-    """Normalised representation of a single flow, no matter version type."""
+    """Normalised representation of a single flow, version-agnostic."""
     src_ip: str
     dst_ip: str
     src_port: int
     dst_port: int
-    protocol: int          # 6=TCP, 17=UDP, 1=ICMP
+    protocol: int          # 6=TCP, 17=UDP, 1=ICMP …
     tcp_flags: int         # bitmask: SYN=0x02, ACK=0x10, FIN=0x01, RST=0x04
     packets: int
     bytes_: int
-    start_ms: int          # milliseconds since router boot
+    start_ms: int          # milliseconds since router boot (relative)
     end_ms: int
     timestamp: float       # Unix epoch (set by collector at receipt time)
 
@@ -66,14 +75,20 @@ class NetFlowRecord:
         }
 
 
-
+# ---------------------------------------------------------------------------
 # NetFlow v5 parser
+# ---------------------------------------------------------------------------
 def parse_netflow_v5(data: bytes, recv_time: float) -> List[NetFlowRecord]:
-
+    """
+    Parse a raw NetFlow v5 UDP datagram.
+    Returns a list of NetFlowRecord objects (one per flow in the packet).
+    """
     if len(data) < NF5_HEADER_SIZE:
         return []
 
     # Header: version(2), count(2), sys_uptime(4), unix_secs(4),
+    #         unix_nsecs(4), flow_sequence(4), engine_type(1), engine_id(1),
+    #         sampling_interval(2)
     version, count = struct.unpack_from("!HH", data, 0)
     if version != 5:
         return []
@@ -113,10 +128,25 @@ def parse_netflow_v5(data: bytes, recv_time: float) -> List[NetFlowRecord]:
     return records
 
 
-
+# ---------------------------------------------------------------------------
 # NetFlow v9 parser
+# ---------------------------------------------------------------------------
 def parse_netflow_v9(data: bytes, recv_time: float, source_addr: str = "default") -> List[NetFlowRecord]:
+    """
+    Parse a NetFlow v9 UDP datagram.
+    Handles Template and Data FlowSets; ignores Options templates.
 
+    Templates are cached in a module-level dict keyed by (source_addr, template_id),
+    because different exporters (routers/switches) commonly reuse the same
+    template_id numbers for completely different field layouts. Without the
+    source_addr key, one exporter's template would silently overwrite another's
+    and corrupt field parsing for the second device.
+
+    source_addr should be the IP address of the exporting device (the UDP
+    packet's source IP), passed in by the collector. Defaults to "default"
+    for callers (e.g. pcap parsing of a single capture) that don't track
+    multiple exporters.
+    """
     if len(data) < 20:
         return []
 
@@ -154,7 +184,7 @@ def parse_netflow_v9(data: bytes, recv_time: float, source_addr: str = "default"
     return records
 
 
-# Module-level template cache: (source_addr, template_id) - list of (field_type, field_len)
+# Module-level template cache: (source_addr, template_id) -> list of (field_type, field_len)
 _NF9_TEMPLATES: dict = {}
 
 
@@ -218,9 +248,17 @@ def _decode_nf9_data(
     return records
 
 
-
+# ---------------------------------------------------------------------------
 # pcap parser (uses scapy when available, falls back to dpkt)
+# ---------------------------------------------------------------------------
 def parse_pcap_file(path: str, recv_time_override: Optional[float] = None):
+    """
+    Yield NetFlowRecord objects from a .pcap file that contains NetFlow v5/v9
+    UDP exports (destination port 2055 / 9995 / 9996 by convention).
+
+    Falls back to raw IP/TCP/UDP extraction if the pcap does not contain
+    NetFlow exports (useful for synthetic test data).
+    """
     import time
 
     try:
@@ -233,6 +271,7 @@ def parse_pcap_file(path: str, recv_time_override: Optional[float] = None):
         except ImportError:
             raise RuntimeError(
                 "Install scapy or dpkt to read pcap files: "
+                "pip install scapy  OR  pip install dpkt"
             )
 
     yield from _parse_pcap(path, recv_time_override)

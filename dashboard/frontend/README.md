@@ -75,7 +75,7 @@ By default, the app runs with mock data so you can explore without a backend. Th
 
 When running with a real backend, the Vite dev server proxies `/api/*` requests to `http://127.0.0.1:8000`. Make sure the FastAPI backend is running on port 8000.
 
-Set `VITE_USE_MOCK=false` in your `.env` file, then start the dev server.
+Set `VITE_USE_MOCK=false` in your `.env` file, then start the dev server. In production, keep `VITE_ALLOW_SIGNUP=false` and create the first administrator from backend environment variables.
 
 ### Building for Production
 
@@ -163,12 +163,29 @@ The frontend expects these endpoints from the FastAPI backend:
 
 ## Security Features
 
-- **Rate limiting** — Account locks for 15 minutes after 5 failed login attempts
-- **Inactivity timeout** — Auto-logout after 30 minutes of no interaction
-- **Session expiry** — Automatic redirect to login on 401 responses
-- **Auth tokens** — JWT Bearer tokens attached to all API requests
-- **Protected routes** — All dashboard pages require authentication
+The frontend works with the secured FastAPI backend added to this project:
 
-## License
+- **Bearer-token authentication** — tokens are attached to all API requests
+- **Protected routes** — dashboard pages require login
+- **Session validation** — saved sessions are verified through `/auth/me`
+- **Session expiry handling** — automatic logout on 401 responses
+- **Inactivity timeout** — auto-logout after 30 minutes of no interaction
+- **Admin-only UI controls** — baseline training/removal buttons are hidden from non-admin users; the backend also enforces this
+- **Registration disabled by default** — set `VITE_ALLOW_SIGNUP=true` only for a controlled demo
 
-This project is part of a final year research project at KNUST.
+
+
+## Recent Dashboard Updates
+
+- The Traffic page now avoids overlapping polling requests, pauses in background tabs, normalises live-score responses, downsamples long series, and paginates device charts.
+- The Overview page includes an interactive donut chart for inventory by type, building, and status.
+- The Settings page allows administrators to add, edit, and remove monitored devices and configure SNMP polling without manually editing `config.yaml`.
+
+Additional API routes used by the frontend:
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/settings/devices` | List configured devices |
+| POST | `/settings/devices` | Add a monitored device |
+| PUT | `/settings/devices/{ip}` | Update a monitored device |
+| DELETE | `/settings/devices/{ip}` | Remove a monitored device |

@@ -1,3 +1,33 @@
+"""
+scheduler.py
+--------------
+Thin APScheduler wrapper around SystemOrchestrator.tick(). This is the
+long-running process that ties the lifecycle together: while collectors
+(netflow_collector.py, prtg_collector.py) run as their own processes
+writing to data/raw/, this scheduler periodically calls tick() to check
+observation progress, trigger training, and trigger retraining.
+
+One scheduled job:
+  - orchestrator_tick: runs every `tick_interval_minutes` (default 60).
+    This is deliberately coarse - training is an expensive, multi-minute
+    operation, and observation/retrain thresholds are measured in days,
+    so checking once an hour is more than sufficient. tick() itself is
+    cheap and a no-op most of the time. Training runs as a blocking
+    subprocess call from within tick(); max_instances=1 ensures ticks
+    don't overlap if a tick is still running training when the next
+    interval fires.
+
+This is an alternative to running orchestrator.py via cron/systemd timers
+(run_once() / `python orchestrator.py` does the same single tick). Use
+whichever fits the deployment - this module is for environments where a
+single long-running Python process is preferred.
+
+Usage:
+    python orchestrator/scheduler.py
+    python orchestrator/scheduler.py --interval-minutes 30
+    python orchestrator/scheduler.py --run-immediately
+"""
+
 import argparse
 import sys
 from datetime import datetime

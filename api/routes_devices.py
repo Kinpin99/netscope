@@ -1,4 +1,6 @@
 """
+api/routes_devices.py
+------------------------
 Device detail view, and the per-device "normal baseline" training endpoint
 (must_add_to_project.txt item 6): "on user request, can create a 'normal
 baseline' for a particular device; Behavioural Anomalies: Detects

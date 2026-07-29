@@ -2,8 +2,9 @@ import { useState, useCallback, useMemo } from 'react'
 import { useParams } from 'react-router-dom'
 import { Loader2 } from 'lucide-react'
 import { usePolling } from '../hooks/usePolling'
+import { useAuth } from '../context/AuthContext'
 import { getDevice, postBaseline, deleteBaseline } from '../api/devices'
-import { getTrafficRecent } from '../api/traffic'
+import { getDeviceTraffic } from '../api/traffic'
 import { getAlerts } from '../api/alerts'
 import { healthColor, formatBytes, formatTime } from '../utils/format'
 import { StatusDot, HealthScore, PulseStrip, AlertItem, EmptyState, Skeleton } from '../components/Shared'
@@ -16,20 +17,18 @@ export default function DeviceDetail() {
   const [range, setRange] = useState(60)
   const [baselineLoading, setBaselineLoading] = useState(false)
   const [baselineMsg, setBaselineMsg] = useState(null)
+  const { user } = useAuth()
+  const isAdmin = user?.role_code === 'admin' || user?.role === 'NOC Admin'
 
   const fetchDevice = useCallback(() => getDevice(ip), [ip])
-  const fetchTraffic = useCallback(() => getTrafficRecent(range), [range])
-  const fetchAlerts = useCallback(() => getAlerts({ device_ip: ip, last_hours: 48 }), [ip])
+  const fetchTraffic = useCallback(() => tab === 'metrics' ? getDeviceTraffic(ip, range) : Promise.resolve([]), [ip, range, tab])
+  const fetchAlerts = useCallback(() => tab === 'alerts' ? getAlerts({ device_ip: ip, last_hours: 48 }) : Promise.resolve([]), [ip, tab])
 
   const { data: device, loading: devLoading, refresh: refreshDevice } = usePolling(fetchDevice, 15_000)
   const { data: traffic, loading: trafficLoading } = usePolling(fetchTraffic, 15_000)
   const { data: alerts } = usePolling(fetchAlerts, 15_000)
 
-  // pull just this device's traffic data
-  const deviceTraffic = useMemo(() => {
-    if (!traffic?.devices?.[ip]) return []
-    return traffic.devices[ip]
-  }, [traffic, ip])
+  const deviceTraffic = useMemo(() => Array.isArray(traffic) ? traffic : [], [traffic])
 
   const handleBaseline = async () => {
     setBaselineLoading(true)
@@ -84,7 +83,7 @@ export default function DeviceDetail() {
           </div>
           <div style={{ textAlign: 'right' }}>
             <HealthScore score={device.health_score} size="lg" />
-            <div style={{ marginTop: 8 }}>
+            {isAdmin && <div style={{ marginTop: 8 }}>
               <button
                 onClick={handleBaseline}
                 disabled={baselineLoading}
@@ -100,7 +99,7 @@ export default function DeviceDetail() {
                 {device.has_per_device_profile ? 'Remove Baseline' : 'Train Baseline'}
               </button>
               {baselineMsg && <div style={{ fontSize: 10, marginTop: 4, color: 'var(--text-dim)' }}>{baselineMsg}</div>}
-            </div>
+            </div>}
           </div>
         </div>
       </div>

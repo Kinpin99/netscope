@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useAuth } from '../context/AuthContext'
+import { ALLOW_SIGNUP } from '../api/client'
 import { Shield, Eye, EyeOff, Loader, UserPlus, LogIn } from 'lucide-react'
 
 const ROLES = ['Engineer', 'NOC Admin', 'Analyst']
@@ -214,8 +215,8 @@ export default function Login() {
         <div className="login-switch">
           {isLogin ? (
             <>
-              <span>Don't have an account?</span>
-              <button className="login-switch-btn" onClick={() => switchMode('register')}>Sign Up</button>
+              {ALLOW_SIGNUP ? <span>Don't have an account?</span> : <span>Need access? Contact the NOC administrator.</span>}
+              {ALLOW_SIGNUP && <button className="login-switch-btn" onClick={() => switchMode('register')}>Sign Up</button>}
             </>
           ) : (
             <>

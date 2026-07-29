@@ -1,3 +1,45 @@
+"""
+ensemble_detector.py
+----------------------
+Live inference: for one time window's worth of NetFlow + PRTG data, compute
+all four feature sets via unified_preprocessing's from_stream() methods,
+score each with its trained Isolation Forest (or Random Forest), and return
+a single DataFrame of per-row anomaly scores ready for alert_engine.py.
+
+This is the piece that closes the loop:
+
+    netflow_raw + prtg_raw (Kafka, 1-min window)
+            |
+            v
+    unified_preprocessing.*.from_stream(..., normalization_stats=stats)
+            |
+            v
+    training.common.score_isolation_forest(bundle, feat)
+            |
+            v
+    DataFrame: [entity_id, window, detector, anomaly_score, profile_used]
+            |
+            v
+    alert_engine.py (risk scoring, dedup, severity)
+
+Model loading happens ONCE at startup (ModelBundle.__init__), then
+score_window() is called once per 1-minute window by stream_router.py.
+Re-loading from disk on every window would be wasteful; instead the
+orchestrator's retraining cycle is expected to trigger a process restart
+(or a future hot-reload signal - see orchestrator._promote's hook-point
+comment) to pick up newly promoted models. ModelBundle.reload() is provided
+for that hook.
+
+Per-device profiles (must_add_to_project.txt item 6):
+    If data/models/device_profiles/<ip>_model.pkl exists for a device, its
+    DEVICE_BEHAVIOR score for that device uses this model instead of the
+    global device_model.pkl, and its z-scores use
+    normalization_stats.json["device_behavior_profiles"][<ip>] instead of
+    normalization_stats.json["device_behavior"][<ip>]. This gives admins a
+    tighter "normal" definition for specific devices without affecting the
+    global model used for everyone else.
+"""
+
 import json
 import sys
 from pathlib import Path
@@ -20,9 +62,17 @@ import logging
 log = logging.getLogger(__name__)
 
 
-
+# ---------------------------------------------------------------------------
 # Model bundle
+# ---------------------------------------------------------------------------
 class ModelBundle:
+    """
+    Holds everything score_window() needs, loaded once at startup:
+      - the four global model bundles (bandwidth, portscan, device_behavior, protocol)
+      - normalization_stats.json (for from_stream's live z-scores)
+      - protocol_baseline.csv (for ProtocolFeatures.from_stream)
+      - per-device model overrides (data/models/device_profiles/)
+    """
 
     def __init__(self, models_dir: Path, processed_dir: Path):
         self.models_dir = Path(models_dir)
@@ -54,7 +104,7 @@ class ModelBundle:
             return json.load(f)
 
     def _load_device_profiles(self) -> Dict[str, dict]:
-        """device_ip - model bundle, for devices with a per-device baseline."""
+        """device_ip -> model bundle, for devices with a per-device baseline."""
         profiles_dir = self.models_dir / "device_profiles"
         profiles: Dict[str, dict] = {}
         if not profiles_dir.exists():
@@ -81,8 +131,9 @@ class ModelBundle:
         return ModelBundle(self.models_dir, self.processed_dir)
 
 
-
+# ---------------------------------------------------------------------------
 # Scoring
+# ---------------------------------------------------------------------------
 def _score_with_bundle(bundle: Optional[dict], feat: pd.DataFrame) -> pd.Series:
     """Score feat with the given model bundle, or return NaN scores if no model."""
     if bundle is None or feat.empty:
@@ -104,6 +155,8 @@ def _score_with_bundle(bundle: Optional[dict], feat: pd.DataFrame) -> pd.Series:
 
 
 # Columns that identify a row rather than describe its behavior - excluded
+# when building the "features" dict attached to each score_window result
+# row (consumed by alerts.risk_scoring.classify_issue_type).
 _ID_COLS = {"device_ip", "src_ip", "window"}
 
 
@@ -117,7 +170,16 @@ def _score_device_with_profile(
     models: "ModelBundle",
     device_ip: str,
 ) -> Dict[tuple, float]:
+    """
+    Re-run DeviceBehaviorFeatures.from_stream restricted to flows involving
+    device_ip, using its per-device normalization stats, and score every
+    resulting window with its per-device model.
 
+    Returns {(device_ip, window): score} for every window this device has
+    data in. Computed once per device (covering all windows in this call's
+    netflow_df) rather than once per row, since from_stream naturally
+    returns all of a device's windows in a single call.
+    """
     profile_bundle = models.device_profiles[device_ip]
     dev_stats = models.normalization_stats.get("device_behavior_profiles", {}).get(device_ip, {})
 
@@ -143,7 +205,10 @@ def _score_device_with_profile(
 
 
 def _row_features(row: pd.Series, id_cols: set) -> dict:
-
+    """Feature values for one row, excluding identifier columns (device_ip,
+    src_ip, window). Used by alert_engine for finer-grained issue
+    classification (e.g. bandwidth congestion vs capacity via if_util_in/out)
+    without needing to recompute features separately."""
     return {k: v for k, v in row.items() if k not in id_cols}
 
 
@@ -158,7 +223,24 @@ def score_window(
     snmp_df: pd.DataFrame,
     models: ModelBundle,
 ) -> pd.DataFrame:
+    """
+    Compute features and anomaly scores for one time window across all four
+    detectors. Returns a long-format DataFrame:
 
+        columns: [detector, entity_id, window, anomaly_score, profile_used, features]
+
+    where entity_id is device_ip (bandwidth, device_behavior, protocol) or
+    src_ip (portscan), profile_used is "global" or "per_device" (only
+    meaningful for device_behavior rows), and features is a dict of that
+    row's computed feature values (e.g. if_util_in/if_util_out for
+    bandwidth) - used by alert_engine.classify_issue_type for finer-grained
+    issue classification without recomputing features.
+
+    Rows with anomaly_score == NaN mean the relevant model wasn't available
+    (e.g. system still in observation phase with no trained models yet) -
+    alert_engine.py should treat NaN scores as "no opinion", not as 0
+    (which would mean "definitely normal").
+    """
     results = []
 
     # --- Bandwidth ---
@@ -198,7 +280,9 @@ def score_window(
     if not db_feat.empty:
         global_scores = _score_with_bundle(models.models["device_behavior"], db_feat)
 
-        # Precompute per-device profile scores ONCE per device (not per row)
+        # Precompute per-device profile scores ONCE per device (not per row) -
+        # from_stream returns all windows for that device in one call, so we
+        # build a {(device_ip, window): score} lookup up front.
         profile_devices = set(db_feat["device_ip"]) & set(models.device_profiles.keys())
         per_device_scores: Dict[tuple, float] = {}
         for device_ip in profile_devices:

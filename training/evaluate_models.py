@@ -1,3 +1,39 @@
+"""
+evaluate_models.py
+--------------------
+Gate between "training just finished" and "orchestrator promotes the new
+models into data/models/". Called as Step 3 of the training pipeline.
+
+For each of the four detectors, this script:
+  1. Loads the newly-trained model bundle (model + feature_columns + metadata)
+  2. Re-derives features from the processed CSV written during training
+  3. Scores the held-out evaluation slice (same split logic as training -
+     split_train_eval - so this isn't scoring data the model was fit on)
+  4. Checks the score distribution against sanity bounds
+
+A model PASSES if:
+  - it loads and scores without error
+  - the evaluation score distribution isn't degenerate (not all-identical,
+    not all-NaN, within expected [0,1] range for Isolation Forest)
+  - for Random Forest (portscan, if labelled), eval accuracy exceeds
+    a minimum threshold
+
+If ANY model fails, this script exits non-zero. The orchestrator interprets
+this as: abort promotion, keep the currently-deployed models, raise a
+low-priority alert for admin review. Models that pass are left in
+data/models/ (already written there by the train_*.py scripts) - the
+orchestrator's job after a pass is just to archive the *previous* model
+versions and mark the new ones as live.
+
+This script does NOT move/archive files itself - see orchestrator/orchestrator.py
+for the promotion/rollback logic. evaluate_models.py only answers
+"is the new model OK to use?".
+
+Usage:
+    python training/evaluate_models.py
+    python training/evaluate_models.py --detectors bandwidth portscan
+"""
+
 import argparse
 import sys
 from pathlib import Path
@@ -15,7 +51,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [evaluate] %(levelna
 log = logging.getLogger(__name__)
 
 
-# Detector name - (model filename, processed features filename)
+# Detector name -> (model filename, processed features filename)
 DETECTOR_FILES = {
     "bandwidth":       ("bandwidth_model.pkl", "bandwidth_features.csv"),
     "portscan":        ("portscan_model.pkl", "portscan_features.csv"),
@@ -23,7 +59,9 @@ DETECTOR_FILES = {
     "protocol":        ("protocol_model.pkl", "protocol_features.csv"),
 }
 
-
+# Isolation Forest decision_function values are typically in roughly
+# [-0.5, 0.5]. score_isolation_forest clips to [0,1] - a degenerate model
+# (e.g. zero-variance scores) means it didn't learn a meaningful boundary.
 MIN_RF_EVAL_ACCURACY = 0.6
 
 
@@ -144,7 +182,11 @@ def evaluate_detector(detector: str, models_dir: Path, processed_dir: Path) -> E
         result.fail("Processed features file is empty")
         return result
 
-
+    # Sanity: every feature_column the model expects should exist in the
+    # processed features (otherwise to_matrix will silently fill zeros for
+    # ALL rows of that column at inference time too - which to_matrix
+    # tolerates, but it's worth flagging here since it usually means the
+    # model and the current preprocessing code have drifted apart).
     missing_cols = [c for c in bundle["feature_columns"] if c not in feat.columns]
     if missing_cols:
         result.fail(

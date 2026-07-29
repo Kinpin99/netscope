@@ -1,3 +1,26 @@
+"""
+topology_builder.py
+----------------------
+Builds two views of the network from config.yaml's device list plus live
+health/alert data:
+
+  1. Building-grouped view (must_add_to_project.txt item 1):
+     "Allows administrators to view issues about network access, network
+     congestion, device status, and error packets from the perspective of
+     buildings."
+
+  2. Flat device list / single-device detail, for simpler dashboard pages.
+
+Edges (topology graph) are not inferred from NetFlow here - that would
+require topology discovery via LLDP/CDP or routing tables, which is out of
+scope for this pass. This returns device nodes grouped by building, which
+is sufficient for the dashboard's building/device list views. A future
+iteration can add edges once topology discovery data is available.
+
+This module reads (not writes) config.yaml, health_scores.json (from
+AlertEngine), and AlertStore - it has no persistence of its own.
+"""
+
 import json
 import sys
 from pathlib import Path
@@ -22,16 +45,18 @@ class TopologyBuilder:
         self.alert_store = AlertStore(Path(alerts_dir))
         self.health_path = self.cfg["paths"]["models_dir"].parent / "health_scores.json"
 
-
+    # -----------------------------------------------------------------
     # Health scores helper
+    # -----------------------------------------------------------------
     def _load_health_scores(self) -> Dict[str, dict]:
         if not self.health_path.exists():
             return {}
         with open(self.health_path) as f:
             return json.load(f)
 
-
+    # -----------------------------------------------------------------
     # Per-device node
+    # -----------------------------------------------------------------
     def _device_node(self, device: dict, health_scores: dict, open_alerts_by_entity: Dict[str, list]) -> dict:
         ip = device["ip"]
         health = health_scores.get(ip)
@@ -46,16 +71,37 @@ class TopologyBuilder:
             "ip": ip,
             "name": device.get("name"),
             "building": device.get("building"),
+            "floor": device.get("floor"),
+            "device_type": device.get("device_type") or device.get("type"),
+            "role": device.get("role"),
+            "source": device.get("source"),
+            "serial_number": device.get("serial_number"),
+            "mac_address": device.get("mac_address"),
             "health_score": health["health_score"] if health else None,
             "detector_scores": health["detector_scores"] if health else {},
             "open_issue_count": len(alerts),
             "max_severity": max_severity,
-            "status": _status_from_health(health["health_score"] if health else None, len(alerts)),
+            "status": _status_from_health(health["health_score"] if health else None, len(alerts), max_severity),
         }
 
-
+    # -----------------------------------------------------------------
     # Building-grouped view (item 1)
+    # -----------------------------------------------------------------
     def building_view(self) -> List[dict]:
+        """
+        Returns one entry per building:
+            {
+              "building": "<name>",
+              "device_count": <int>,
+              "open_issue_count": <int>,
+              "max_severity": "info".."critical",
+              "avg_health_score": <float> | None,
+              "devices": [<device node dicts>],
+            }
+
+        Devices with no "building" set in config.yaml are grouped under
+        "Unassigned".
+        """
         health_scores = self._load_health_scores()
         open_alerts = self.alert_store.list_open_alerts()
 
@@ -92,8 +138,9 @@ class TopologyBuilder:
 
         return sorted(result, key=lambda b: b["building"])
 
-
-    # Flat device list with status for a simple device-list dashboard page
+    # -----------------------------------------------------------------
+    # Flat device list with status (for a simple device-list dashboard page)
+    # -----------------------------------------------------------------
     def device_list(self) -> List[dict]:
         health_scores = self._load_health_scores()
         open_alerts = self.alert_store.list_open_alerts()
@@ -107,8 +154,9 @@ class TopologyBuilder:
             for device in self.cfg.get("devices", [])
         ]
 
-
+    # -----------------------------------------------------------------
     # Single device detail
+    # -----------------------------------------------------------------
     def device_detail(self, ip: str) -> Optional[dict]:
         device = get_device_by_ip(self.cfg, ip)
         if device is None:
@@ -129,10 +177,20 @@ class TopologyBuilder:
         return (profiles_dir / f"{safe_name}_model.pkl").exists()
 
 
-def _status_from_health(health_score: Optional[float], open_issue_count: int) -> str:
+def _status_from_health(health_score: Optional[float], open_issue_count: int, max_severity: str = "info") -> str:
+    """Coarse status label for dashboard device lists/icons.
+
+    Persisted alerts take precedence over a missing/stale health score. This
+    matters for source-keyed detectors such as port scans: the scanner can
+    have a real alert even when no device health score has been calculated.
+    """
+    if open_issue_count > 0:
+        if max_severity in {"critical", "high"}:
+            return "critical"
+        return "degraded"
     if health_score is None:
         return "unknown"
-    if open_issue_count == 0 and health_score >= 90:
+    if health_score >= 90:
         return "healthy"
     if health_score >= 50:
         return "degraded"

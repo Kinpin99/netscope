@@ -1,30 +1,69 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 
+/**
+ * Poll without overlapping requests. Polling pauses while the tab is hidden,
+ * which prevents slow traffic queries from stacking up and freezing the UI.
+ */
 export function usePolling(fetcher, intervalMs) {
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(true)
-  const fetcherRef = useRef(fetcher)
-  fetcherRef.current = fetcher
+  const inFlightRef = useRef(false)
+  const mountedRef = useRef(true)
+  const runRef = useRef(null)
 
-  const run = useCallback(async () => {
-    try {
-      const result = await fetcherRef.current()
-      setData(result)
-      setError(null)
-    } catch (err) {
-      // don't clear good data on transient errors
-      setError(err.message)
-    } finally {
-      setLoading(false)
-    }
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
   }, [])
 
   useEffect(() => {
-    run()
-    const id = setInterval(run, intervalMs)
-    return () => clearInterval(id)
-  }, [run, intervalMs])
+    let cancelled = false
+    let timerId = null
 
-  return { data, error, loading, refresh: run }
+    const run = async ({ force = false } = {}) => {
+      if (cancelled || inFlightRef.current) return
+      if (!force && typeof document !== 'undefined' && document.hidden) return
+
+      inFlightRef.current = true
+      try {
+        const result = await fetcher()
+        if (!cancelled && mountedRef.current) {
+          setData(result)
+          setError(null)
+        }
+      } catch (err) {
+        if (!cancelled && mountedRef.current) {
+          // Keep the last good result on transient failures.
+          setError(err?.message || 'Unable to refresh data')
+        }
+      } finally {
+        inFlightRef.current = false
+        if (!cancelled && mountedRef.current) setLoading(false)
+      }
+    }
+
+    runRef.current = run
+
+    const tick = async () => {
+      await run()
+      if (!cancelled) timerId = window.setTimeout(tick, intervalMs)
+    }
+
+    tick()
+
+    const onVisibilityChange = () => {
+      if (!document.hidden) run({ force: true })
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+
+    return () => {
+      cancelled = true
+      if (timerId) window.clearTimeout(timerId)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+    }
+  }, [fetcher, intervalMs])
+
+  const refresh = useCallback(() => runRef.current?.({ force: true }), [])
+  return { data, error, loading, refresh }
 }

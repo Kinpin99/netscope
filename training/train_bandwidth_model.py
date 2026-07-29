@@ -1,3 +1,22 @@
+"""
+train_bandwidth_model.py
+--------------------------
+Trains the Bandwidth Spike Detector model.
+
+Pipeline:
+    netflow_raw + prtg_raw  --[unified_preprocessing.BandwidthFeatures]-->
+    bandwidth_features.csv  --[IsolationForest]--> bandwidth_model.pkl
+                             --[compute_normalization_stats]--> normalization_stats.json["bandwidth"]
+
+This script never touches Kafka or the collectors - it only reads CSVs
+(or directories of daily-rotated CSVs), per the training/inference
+separation in unified_preprocessing.py.
+
+Usage:
+    python training/train_bandwidth_model.py
+    python training/train_bandwidth_model.py --netflow data/raw --prtg data/raw
+"""
+
 import argparse
 import sys
 from pathlib import Path
@@ -75,7 +94,7 @@ def main():
     )
     log.info("Saved model -> %s (trained on %d rows)", model_path, len(train_df))
 
-    # Held-out eval summary - evaluate_models.py does the gating
+    # Held-out eval summary (informational - evaluate_models.py does the gating)
     if not eval_df.empty:
         X_eval = to_matrix(eval_df, cols)
         eval_scores = model.decision_function(X_eval)
@@ -84,7 +103,7 @@ def main():
             len(eval_df), eval_scores.mean(), eval_scores.min(), eval_scores.max(),
         )
 
-    # Normalization stats, used by from_stream's live z-score columns
+    # Normalization stats (used by from_stream's live z-score columns)
     stats = compute_normalization_stats(feat, "device_ip", BandwidthFeatures.ZSCORE_VALUE_COLS)
     stats_path = models_dir / "normalization_stats.json"
     write_normalization_stats_slice(stats_path, "bandwidth", stats)
