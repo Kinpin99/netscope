@@ -1,41 +1,6 @@
-import { useState, useEffect } from 'react'
+import { Bell,RefreshCw } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { useAlerts } from '../../context/AlertContext'
 import { useSystem } from '../../context/SystemContext'
-
-const phaseColors = {
-  inference: 'var(--accent)',
-  training: 'var(--sev-medium)',
-  observation: 'var(--text-dim)',
-}
-
-export default function Topbar() {
-  const { status } = useSystem()
-  const [tick, setTick] = useState(0)
-
-  useEffect(() => {
-    const id = setInterval(() => setTick(t => t + 1), 1000)
-    return () => clearInterval(id)
-  }, [])
-
-  // reset tick when status refreshes
-  useEffect(() => { setTick(0) }, [status])
-
-  const phase = status?.phase || 'observation'
-  const dotColor = phaseColors[phase]
-
-  return (
-    <header style={{
-      height: 'var(--topbar-h)', background: 'var(--panel)',
-      borderBottom: '1px solid var(--border)',
-      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-      padding: '0 22px', flexShrink: 0,
-    }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: 'var(--text-dim)' }}>
-        <span className="pulse" style={{ width: 6, height: 6, borderRadius: '50%', background: dotColor, display: 'inline-block' }} />
-        <span>{phase === 'inference' ? 'Live' : phase === 'training' ? 'Training' : 'Observing'} · {tick}s ago</span>
-      </div>
-      <div className="mono dim" style={{ fontSize: 10 }}>
-        {status ? `v${status.models_version}` : ''}
-      </div>
-    </header>
-  )
-}
+const phaseText=(p)=>({observation:'Learning normal activity',training:'Preparing checks',inference:'Live monitoring'}[p]||'Starting')
+export default function Topbar(){const {urgentCount,refresh:refreshAlerts}=useAlerts();const {status,refresh:refreshSystem}=useSystem();return <header className="h-[54px] bg-[var(--surface)] border-b border-[var(--border)] flex items-center px-5 gap-4 shrink-0"><div className="flex items-center gap-2 text-[11px] text-[var(--muted)]"><span className="live-dot w-[6px] h-[6px] rounded-full bg-[var(--ok)]"/><span>{phaseText(status?.phase)}</span></div><div className="ml-auto flex items-center gap-2"><button title="Refresh" onClick={()=>{refreshAlerts?.();refreshSystem?.()}} className="p-2 text-[var(--muted)] hover:text-[var(--text)]"><RefreshCw size={15}/></button><Link to="/alerts" className="relative p-2 text-[var(--muted)] hover:text-[var(--text)]"><Bell size={16}/>{urgentCount>0&&<span className="absolute top-1 right-1 min-w-[8px] h-[8px] rounded-full bg-[var(--crit)]"/>}</Link></div></header>}

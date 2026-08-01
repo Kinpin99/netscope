@@ -1,111 +1,14 @@
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, Monitor, AlertTriangle, Activity, Settings, LogOut, Wifi, UserPlus, Wrench } from 'lucide-react'
+import { LayoutDashboard,Monitor,AlertTriangle,Network,Activity,History,Settings,Wifi,UserPlus,Wrench,ShieldCheck,LogOut } from 'lucide-react'
 import { useAlerts } from '../../context/AlertContext'
 import { useAuth } from '../../context/AuthContext'
-
-const navSections = [
-  {
-    label: 'Monitor',
-    items: [
-      { to: '/', icon: LayoutDashboard, label: 'Overview' },
-      { to: '/devices', icon: Monitor, label: 'Devices' },
-      { to: '/access-points', icon: Wifi, label: 'Access Points' },
-      { to: '/onboarding', icon: UserPlus, label: 'Onboarding' },
-      { to: '/alerts', icon: AlertTriangle, label: 'Alerts', badge: true },
-      { to: '/troubleshooting', icon: Wrench, label: 'Troubleshooting' },
-      { to: '/traffic', icon: Activity, label: 'Traffic' },
-    ],
-  },
-  {
-    label: 'System',
-    items: [
-      { to: '/settings', icon: Settings, label: 'Settings' },
-    ],
-  },
+const sections=[
+ {label:'Monitor',items:[['/','Overview',LayoutDashboard],['/devices','Devices',Monitor],['/access-points','Access Points',Wifi],['/onboarding','New Devices',UserPlus],['/alerts','Alerts',AlertTriangle,true],['/topology','Network Map',Network]]},
+ {label:'Review',items:[['/traffic','Traffic',Activity],['/detectors','Checks',ShieldCheck],['/history','History',History],['/troubleshooting','Troubleshooting',Wrench]]},
+ {label:'System',items:[['/settings','Settings',Settings]]},
 ]
-
-export default function Sidebar() {
-  const { openAlerts } = useAlerts()
-  const { user, logout } = useAuth()
-  const alertCount = openAlerts.length
-
-  const initials = user?.name
-    ? user.name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase()
-    : 'U'
-
-  return (
-    <aside style={{
-      width: 'var(--sidebar-w)', height: '100%', background: 'var(--panel)',
-      borderRight: '1px solid var(--border)', display: 'flex', flexDirection: 'column', flexShrink: 0,
-    }}>
-      {/* logo */}
-      <div style={{ padding: '16px 20px', display: 'flex', alignItems: 'center', gap: 12 }}>
-        <div style={{
-          width: 30, height: 30, borderRadius: 7, background: 'var(--accent)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}>
-          <span style={{ color: '#0B0E14', fontWeight: 800, fontSize: 15, lineHeight: 1 }}>N</span>
-        </div>
-        <div>
-          <div style={{ fontSize: 13, fontWeight: 700, lineHeight: 1.2 }}>NetScope</div>
-          <div style={{ fontSize: 10, color: 'var(--text-dim)', letterSpacing: '0.06em', textTransform: 'uppercase' }}>KNUST NOC</div>
-        </div>
-      </div>
-
-      {/* nav */}
-      <nav style={{ flex: 1, padding: '4px 10px', display: 'flex', flexDirection: 'column', gap: 2, overflowY: 'auto' }}>
-        {navSections.map((section) => (
-          <div key={section.label} style={{ marginBottom: 8 }}>
-            <div style={{ padding: '8px 12px', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.09em', color: 'var(--text-dim)', fontWeight: 600 }}>
-              {section.label}
-            </div>
-            {section.items.map((item) => (
-              <NavLink
-                key={item.to}
-                to={item.to}
-                end={item.to === '/'}
-                style={({ isActive }) => ({
-                  display: 'flex', alignItems: 'center', gap: 10,
-                  padding: '8px 12px', borderRadius: 'var(--radius)',
-                  fontSize: 12, textDecoration: 'none', transition: 'all 0.15s',
-                  color: isActive ? 'var(--text)' : 'var(--text-dim)',
-                  background: isActive ? 'rgba(74,222,128,0.06)' : 'transparent',
-                  borderLeft: isActive ? '2px solid var(--accent)' : '2px solid transparent',
-                  marginLeft: isActive ? -1 : 0,
-                })}
-              >
-                <item.icon size={15} />
-                <span style={{ flex: 1 }}>{item.label}</span>
-                {item.badge && alertCount > 0 && (
-                  <span style={{
-                    minWidth: 18, height: 18, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    borderRadius: 99, background: 'var(--sev-critical)', color: '#fff',
-                    fontSize: 9, fontWeight: 700, padding: '0 5px',
-                  }}>
-                    {alertCount}
-                  </span>
-                )}
-              </NavLink>
-            ))}
-          </div>
-        ))}
-      </nav>
-
-      {/* user + logout */}
-      <div style={{ padding: '16px 20px', borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10 }}>
-        <div style={{
-          width: 28, height: 28, borderRadius: '50%', background: 'var(--panel-alt)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 10, fontWeight: 700, color: 'var(--text-dim)',
-        }}>{initials}</div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 11, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user?.name || 'User'}</div>
-          <div style={{ fontSize: 10, color: 'var(--text-dim)' }}>{user?.role || 'Operator'}</div>
-        </div>
-        <button className="sidebar-logout" onClick={logout} title="Sign out">
-          <LogOut size={14} />
-        </button>
-      </div>
-    </aside>
-  )
-}
+export default function Sidebar(){const {urgentCount}=useAlerts();const {user,logout}=useAuth();const initials=(user?.name||user?.username||'User').split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase();return <aside className="w-[216px] h-full bg-[var(--surface)] border-r border-[var(--border)] flex flex-col shrink-0">
+ <div className="px-5 py-4 flex items-center gap-3"><div className="w-[30px] h-[30px] rounded-[7px] bg-[var(--accent)] grid place-items-center text-white font-extrabold">N</div><div><div className="text-[13px] font-bold">NetScope</div><div className="text-[10px] text-[var(--muted)] tracking-[.06em] uppercase">KNUST NOC</div></div></div>
+ <nav className="flex-1 px-3 py-2 overflow-y-auto">{sections.map(s=><div key={s.label} className="mb-2"><div className="px-3 py-2 text-[10px] uppercase tracking-[.1em] text-[var(--muted)] font-semibold">{s.label}</div>{s.items.map(([to,label,Icon,badge])=><NavLink key={to} to={to} end={to==='/'} className={({isActive})=>`flex items-center gap-3 px-3 py-2 rounded text-[12px] transition-colors ${isActive?'border-l-2 border-[var(--accent)] bg-[rgba(79,124,255,.08)] text-[var(--text)] -ml-px':'text-[var(--muted)] hover:text-[var(--text)] hover:bg-white/[.025]'}`}><Icon size={15}/><span className="flex-1">{label}</span>{badge&&urgentCount>0&&<span className="min-w-[18px] h-[18px] grid place-items-center rounded-full bg-[var(--crit)] text-white text-[9px] font-bold px-1">{urgentCount}</span>}</NavLink>)}</div>)}</nav>
+ <div className="px-5 py-4 border-t border-[var(--border)] flex items-center gap-3"><div className="w-[28px] h-[28px] rounded-full bg-[var(--surface2)] grid place-items-center text-[10px] font-bold text-[var(--muted)]">{initials}</div><div className="min-w-0 flex-1"><div className="text-[11px] font-medium truncate">{user?.name||user?.username}</div><div className="text-[10px] text-[var(--muted)]">{String(user?.role||'User').replaceAll('_',' ')}</div></div><button onClick={logout} title="Sign out" className="text-[var(--muted)] hover:text-[var(--text)]"><LogOut size={15}/></button></div>
+ </aside>}

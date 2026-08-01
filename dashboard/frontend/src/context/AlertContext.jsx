@@ -1,55 +1,24 @@
-import { createContext, useContext, useReducer, useCallback, useRef } from 'react'
-import { getOpenAlerts } from '../api/alerts'
+import { createContext,useContext,useCallback,useMemo,useRef,useState } from 'react'
 import { usePolling } from '../hooks/usePolling'
-
-const AlertContext = createContext(null)
-
-function reducer(state, action) {
-  switch (action.type) {
-    case 'SET_OPEN':
-      return { ...state, openAlerts: action.payload }
-    case 'ADD_NOTIFICATION':
-      return { ...state, notifications: [action.payload, ...state.notifications].slice(0, 3) }
-    case 'DISMISS_NOTIFICATION':
-      return { ...state, notifications: state.notifications.filter(n => n.id !== action.id) }
-    default:
-      return state
-  }
+import { getAlerts } from '../api/alerts'
+import { score100,epochDate } from '../utils/friendly'
+const AlertContext=createContext(null)
+const norm=(a={})=>({
+  ...a,
+  event_id:a.alert_id||a.id,
+  device_id:a.device_name||a.entity_id||'Unknown device',
+  device_ip:a.entity_id,
+  anomaly_type:a.detector||a.issue_type||'network_issue',
+  severity_score:score100(a.anomaly_score??a.last_score??a.max_score)??0,
+  detected_at:(epochDate(a.window??a.last_window??a.created_at)||new Date()).toISOString(),
+  status:a.status||'open',
+})
+export function AlertProvider({children}){
+  const fetcher=useCallback(()=>getAlerts({last_hours:168}),[])
+  const {data,loading,error,refresh}=usePolling(fetcher,10000)
+  const alerts=useMemo(()=>Array.isArray(data)?data.map(norm).sort((a,b)=>new Date(b.detected_at)-new Date(a.detected_at)):[],[data])
+  const openAlerts=useMemo(()=>alerts.filter(a=>a.status==='open'),[alerts])
+  const urgentCount=openAlerts.filter(a=>['critical','high'].includes(String(a.severity).toLowerCase())).length
+  return <AlertContext.Provider value={{alerts,openAlerts,urgentCount,loading,error,refresh}}>{children}</AlertContext.Provider>
 }
-
-export function AlertProvider({ children }) {
-  const [state, dispatch] = useReducer(reducer, {
-    openAlerts: [],
-    notifications: [],
-  })
-  const prevIdsRef = useRef(new Set())
-
-  const fetcher = useCallback(async () => {
-    const alerts = await getOpenAlerts()
-    const currentIds = new Set(alerts.map(a => a.alert_id))
-
-    // fire notifications for newly-appeared alerts
-    alerts.forEach(alert => {
-      if (!prevIdsRef.current.has(alert.alert_id)) {
-        dispatch({ type: 'ADD_NOTIFICATION', payload: { ...alert, id: alert.alert_id } })
-      }
-    })
-    prevIdsRef.current = currentIds
-    dispatch({ type: 'SET_OPEN', payload: alerts })
-    return alerts
-  }, [])
-
-  usePolling(fetcher, 10_000)
-
-  const dismissNotification = useCallback((id) => {
-    dispatch({ type: 'DISMISS_NOTIFICATION', id })
-  }, [])
-
-  return (
-    <AlertContext.Provider value={{ ...state, dismissNotification }}>
-      {children}
-    </AlertContext.Provider>
-  )
-}
-
-export const useAlerts = () => useContext(AlertContext)
+export const useAlerts=()=>useContext(AlertContext)

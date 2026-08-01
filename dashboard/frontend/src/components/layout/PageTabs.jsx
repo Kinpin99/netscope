@@ -1,0 +1,3 @@
+import { useLocation } from 'react-router-dom'
+const names={ '/':'Dashboard','/devices':'Devices','/alerts':'Alerts','/topology':'Network Map','/traffic':'Traffic','/detectors':'Checks','/history':'History','/troubleshooting':'Troubleshooting','/access-points':'Access Points','/onboarding':'New Devices','/settings':'Settings'}
+export default function PageTabs(){const {pathname}=useLocation();const base=pathname.startsWith('/devices/')?'/devices':pathname;return <div className="border-b border-[var(--border)] px-5"><div className="inline-flex px-4 py-3 text-[11px] font-medium border-b-2 border-[var(--accent)]">{names[base]||'NetScope'}</div></div>}

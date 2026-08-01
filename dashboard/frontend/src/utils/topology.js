@@ -1,0 +1,3 @@
+const LAYER_Y={router:55,switch:175,access_point:300,wireless_ap:300,ap:300,server:300,host:300,client:300,network_device:210}
+export const calculateNodePositions=(nodes,width=600,height=340)=>{const layers={};nodes.forEach(n=>{const type=String(n.type||'host').toLowerCase();const y=LAYER_Y[type]??220;(layers[y]??=[]).push(n)});const pos={};Object.entries(layers).forEach(([y,list])=>{const spacing=width/(list.length+1);list.forEach((n,i)=>{pos[n.id]={x:spacing*(i+1),y:Number(y)}})});return pos}
+export const getNodeRadius=t=>({router:18,switch:16,access_point:13,wireless_ap:13,ap:13,server:12,host:10,client:10}[String(t).toLowerCase()]||12)

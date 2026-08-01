@@ -1,120 +1,30 @@
-import { useState, useCallback } from 'react'
+import { useMemo,useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ChevronDown, ChevronRight, ArrowUpRight } from 'lucide-react'
-import { usePolling } from '../hooks/usePolling'
-import { useAlerts } from '../context/AlertContext'
-import { useSystem } from '../context/SystemContext'
-import { getBuildings } from '../api/topology'
-import { SeverityBadge, StatusDot, HealthScore, PulseStrip, AlertItem, EmptyState, Skeleton } from '../components/Shared'
-import NetworkCompositionChart from '../components/NetworkCompositionChart'
-
-function BuildingCard({ building }) {
-  const [open, setOpen] = useState(building.devices.length <= 5)
-  const navigate = useNavigate()
-
-  return (
-    <div className="panel" style={{ marginBottom: 12 }}>
-      <button
-        onClick={() => setOpen(!open)}
-        style={{ width: '100%', padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 12, textAlign: 'left', background: 'transparent' }}
-      >
-        {open ? <ChevronDown size={14} color="var(--text-dim)" /> : <ChevronRight size={14} color="var(--text-dim)" />}
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>{building.building}</div>
-          <div style={{ fontSize: 11, color: 'var(--text-dim)', display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-            <span>{building.device_count} devices</span>
-            <span>·</span>
-            <span>{building.open_issue_count} open issues</span>
-            {building.max_severity && building.open_issue_count > 0 && (
-              <>
-                <span>·</span>
-                <SeverityBadge severity={building.max_severity} />
-              </>
-            )}
-          </div>
-        </div>
-        <div style={{ textAlign: 'right' }}>
-          <div className="mono" style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 4 }}>avg health</div>
-          <HealthScore score={building.avg_health_score} size="sm" />
-        </div>
-      </button>
-
-      {/* pulse strip */}
-      <div style={{ padding: '0 16px 10px' }}>
-        <PulseStrip samples={building.devices.map(d => d.health_score)} />
-      </div>
-
-      {/* device list */}
-      {open && (
-        <div style={{ borderTop: '1px solid var(--border)' }}>
-          {building.devices.map((d) => (
-            <button
-              key={d.ip}
-              onClick={() => navigate(`/devices/${d.ip}`)}
-              style={{
-                width: '100%', display: 'flex', alignItems: 'center', gap: 10,
-                padding: '8px 16px', textAlign: 'left', fontSize: 11,
-                borderBottom: '1px solid var(--border)', background: 'transparent',
-              }}
-            >
-              <StatusDot status={d.status} size={6} />
-              <span style={{ flex: 1, fontWeight: 500 }}>{d.name}</span>
-              <span className="mono dim" style={{ fontSize: 10, width: 80 }}>{d.ip}</span>
-              <HealthScore score={d.health_score} size="sm" />
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-export default function Overview() {
-  const navigate = useNavigate()
-  const { status } = useSystem()
-  const { openAlerts } = useAlerts()
-  const fetchBuildings = useCallback(() => getBuildings(), [])
-  const { data: buildings, loading } = usePolling(fetchBuildings, 15_000)
-  const isObservation = status?.phase === 'observation'
-
-  return (
-    <div>
-      <div className="section-label">Network Inventory</div>
-      {!loading && <NetworkCompositionChart buildings={buildings || []} />}
-
-      {/* buildings */}
-      <div className="section-label">Buildings</div>
-      {loading ? (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <Skeleton width="100%" height={120} />
-          <Skeleton width="100%" height={120} />
-          <Skeleton width="100%" height={120} />
-        </div>
-      ) : buildings?.length ? (
-        buildings.map((b) => <BuildingCard key={b.building} building={b} />)
-      ) : (
-        <EmptyState message="No buildings found" />
-      )}
-
-      {/* open alerts */}
-      <div style={{ marginTop: 24 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-          <div className="section-label" style={{ marginBottom: 0, flex: 1 }}>Open Alerts</div>
-          <button
-            onClick={() => navigate('/alerts')}
-            style={{ fontSize: 11, color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 4 }}
-          >
-            view all <ArrowUpRight size={12} />
-          </button>
-        </div>
-        {openAlerts.length > 0 ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {openAlerts.map((a) => <AlertItem key={a.alert_id} alert={a} />)}
-          </div>
-        ) : (
-          <EmptyState message={isObservation ? 'Alerts are unavailable during the observation phase. The system needs more data before it can detect anomalies.' : 'No open alerts — network looks clean.'} />
-        )}
-      </div>
-    </div>
-  )
-}
+import { AreaChart,Area,XAxis,YAxis,CartesianGrid,ResponsiveContainer,Tooltip,PieChart,Pie,Cell,BarChart,Bar } from 'recharts'
+import { ArrowUpRight } from 'lucide-react'
+import { useDevices } from '../context/DeviceContext';import { useAlerts } from '../context/AlertContext';import { useTraffic } from '../context/TrafficContext';import { useSystem } from '../context/SystemContext'
+import SectionLabel from '../components/ui/SectionLabel';import StatCard from '../components/ui/StatCard';import DetectorCard from '../components/ui/DetectorCard';import TopologyGraph from '../components/topology/TopologyGraph';import FriendlyAlertItem from '../components/ui/FriendlyAlertItem';import EmptyPanel from '../components/ui/EmptyPanel'
+import { friendlyCheck,friendlyStatus,score100,deviceTypeLabel } from '../utils/friendly';import { formatBps } from '../utils/formatters';import { getTopologyGraph } from '../api/topology';import { getPendingDevices } from '../api/onboarding';import { usePolling } from '../hooks/usePolling';import { useCallback } from 'react'
+const COLORS=['var(--ok)','var(--warn)','var(--crit)','var(--info)','var(--accent)']
+const toBps=(bytes,sec=60)=>(Number(bytes)||0)*8/sec
+export default function Overview(){const nav=useNavigate();const {devices}=useDevices();const {alerts,openAlerts}=useAlerts();const {traffic,liveScores}=useTraffic();const {status}=useSystem();const [expanded,setExpanded]=useState(null)
+ const graphFetch=useCallback(()=>getTopologyGraph(),[]);const pendingFetch=useCallback(()=>getPendingDevices(),[]);const {data:graph}=usePolling(graphFetch,30000);const {data:pending}=usePolling(pendingFetch,30000)
+ const scored=devices.filter(d=>Number.isFinite(Number(d.health_score)));const avgHealth=scored.length?Math.round(scored.reduce((s,d)=>s+Number(d.health_score),0)/scored.length):null;const reporting=devices.filter(d=>d.status!=='unknown').length;const urgent=openAlerts.filter(a=>['critical','high'].includes(String(a.severity).toLowerCase())).length;const today=alerts.filter(a=>new Date(a.detected_at).toDateString()===new Date().toDateString()).length
+ const net=(traffic.network||[]).map(x=>({time:new Date(x.window*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),in:toBps(x.bytes_in),out:toBps(x.bytes_out)}));const last=net.at(-1);const current=(last?.in||0)+(last?.out||0)
+ const healthSpark=devices.map((d,i)=>({name:i,value:Number(d.health_score)||0}));const alertSpark=alerts.slice(0,24).reverse().map((a,i)=>({name:i,value:a.severity_score}));const trafficSpark=net.slice(-24).map((x,i)=>({name:i,value:x.in+x.out}));
+ const byStatus=useMemo(()=>{const c={Good:0,'Needs attention':0,Urgent:0,'No recent data':0};devices.forEach(d=>{const k=friendlyStatus(d.status);c[k]=(c[k]||0)+1});return Object.entries(c).filter(([,v])=>v).map(([name,value])=>({name,value}))},[devices])
+ const checkKeys=['bandwidth','portscan','device_behavior','protocol'];const checkCards=checkKeys.map(k=>{const related=liveScores.filter(s=>String(s.detector||'')===k);const recentAlerts=alerts.filter(a=>String(a.detector||a.anomaly_type||'')===k);const scores=related.slice(-12).map((x,i)=>({name:i,value:score100(x.score??x.anomaly_score)??0}));const high=Math.max(0,...related.map(x=>score100(x.score??x.anomaly_score)??0));return {key:k,label:friendlyCheck(k),score:high,count:recentAlerts.length,data:scores}})
+ const topoNodes=(graph?.nodes||[]).map(n=>{const d=devices.find(x=>x.ip===n.ip||x.ip===n.id);return {id:n.id||n.ip,label:n.name||d?.name||n.ip,type:n.device_type||n.type||d?.device_type||'host',health_score:d?.health_score==null?null:Number(d.health_score)}});const topoEdges=graph?.edges||[]
+ return <div className="space-y-[18px]">
+  <div className="bg-[var(--surface)] border border-[var(--border)] rounded-[7px]">
+   <div className="flex justify-between items-center px-4 py-3 border-b border-[var(--border)]"><div><h2 className="text-[13px] font-semibold">Campus Network — Current Activity</h2><p className="text-[10px] text-[var(--muted)] mt-1">A live view of traffic, devices and open issues.</p></div><div className="text-right"><div className="text-[25px] font-extrabold" style={{color:avgHealth==null?'var(--muted)':avgHealth>=70?'var(--ok)':avgHealth>=40?'var(--warn)':'var(--crit)'}}>{avgHealth??'—'}<span className="text-[10px] text-[var(--muted)] font-normal"> / 100</span></div><div className="text-[10px] text-[var(--muted)]">Overall health</div></div></div>
+   <div className="grid grid-cols-6 border-b border-[var(--border)] divide-x divide-[var(--border)]">{[
+    ['Registered devices',devices.length],['Reporting now',`${reporting}/${devices.length}`],['Open alerts',openAlerts.length],['Issues today',today],['Traffic now',formatBps(current)],['Waiting approval',pending?.length||0]
+   ].map(([l,v])=><div key={l} className="px-3 py-2.5 text-center"><div className="text-[9px] uppercase tracking-[.06em] text-[var(--muted)] font-semibold">{l}</div><div className="text-[14px] font-extrabold mt-1 font-mono">{v}</div></div>)}</div>
+   <div className="p-4">{net.length?<ResponsiveContainer width="100%" height={210}><AreaChart data={net}><defs><linearGradient id="netin" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="var(--accent)" stopOpacity=".24"/><stop offset="1" stopColor="var(--accent)" stopOpacity="0"/></linearGradient><linearGradient id="netout" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="var(--ok)" stopOpacity=".16"/><stop offset="1" stopColor="var(--ok)" stopOpacity="0"/></linearGradient></defs><CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false}/><XAxis dataKey="time" tick={{fontSize:9,fill:'var(--muted)'}} axisLine={false} tickLine={false}/><YAxis tickFormatter={formatBps} tick={{fontSize:9,fill:'var(--muted)'}} axisLine={false} tickLine={false}/><Tooltip contentStyle={{background:'var(--surface)',border:'1px solid var(--border)',fontSize:10}} formatter={v=>formatBps(v)}/><Area type="monotone" dataKey="in" name="Received" stroke="var(--accent)" fill="url(#netin)" strokeWidth={1.8} isAnimationActive={false}/><Area type="monotone" dataKey="out" name="Sent" stroke="var(--ok)" fill="url(#netout)" strokeWidth={1.5} isAnimationActive={false}/></AreaChart></ResponsiveContainer>:<EmptyPanel message="Traffic will appear after the collectors receive data."/>}</div>
+  </div>
+  <SectionLabel label="Network Summary"/><div className="grid grid-cols-4 gap-4 desktop-grid-4"><StatCard label="Network health" value={avgHealth??'—'} percentage={avgHealth==null?'Waiting for data':`${avgHealth}%`} percentageLabel={avgHealth==null?'':avgHealth>=70?'Good':avgHealth>=40?'Needs attention':'Urgent'} chartData={healthSpark} chartColor="var(--ok)" statusLine={`${scored.length} devices have a health score`}/><StatCard label="Devices reporting" value={reporting} percentage={devices.length?`${Math.round(reporting/devices.length*100)}%`:'0%'} percentageLabel="of registered devices" chartData={healthSpark} chartColor="var(--accent)" statusLine={`${devices.length-reporting} have no recent data`}/><StatCard label="Open alerts" value={openAlerts.length} percentage={`${urgent}`} percentageLabel="urgent" chartData={alertSpark} chartColor="var(--warn)" statusLine={`${today} issues seen today`}/><StatCard label="Traffic now" value={formatBps(current)} percentage="Live" percentageLabel="received and sent" chartData={trafficSpark} chartColor="var(--accent)" statusLine={`${traffic.device_count||0} active addresses in this view`}/></div>
+  <SectionLabel label="System Checks"/><div className="grid grid-cols-4 gap-4 desktop-grid-4">{checkCards.map(c=><DetectorCard key={c.key} name={c.label} model="Live check" score={c.score} scoreLabel="latest score" chartData={c.data} chartColor={c.score>=71?'var(--crit)':c.score>=31?'var(--warn)':'var(--ok)'} statusLine={`${c.count} alerts in the last 7 days`}/>)}</div>
+  <SectionLabel label="Network Overview"/><div className="grid gap-4 desktop-grid-2" style={{gridTemplateColumns:'1fr 340px'}}><div className="bg-[var(--surface)] border border-[var(--border)] rounded-[7px]"><div className="px-4 py-3 border-b border-[var(--border)] flex justify-between"><span className="text-[10px] uppercase tracking-[.08em] text-[var(--muted)] font-semibold">Network map</span><button onClick={()=>nav('/topology')} className="text-[10px] text-[var(--accent)] flex gap-1 items-center">Open full map <ArrowUpRight size={12}/></button></div><div className="p-4">{topoNodes.length?<TopologyGraph nodes={topoNodes} edges={topoEdges} width={760} height={330} criticalDevices={openAlerts.filter(a=>['critical','high'].includes(String(a.severity))).map(a=>a.device_ip)}/>:<EmptyPanel message="Add network links in Settings to build the map."/>}</div></div><div className="bg-[var(--surface)] border border-[var(--border)] rounded-[7px]"><div className="px-4 py-3 border-b border-[var(--border)] text-[10px] uppercase tracking-[.08em] text-[var(--muted)] font-semibold">Device status</div><div className="p-3">{byStatus.length?<><ResponsiveContainer width="100%" height={210}><PieChart><Pie data={byStatus} dataKey="value" nameKey="name" innerRadius={52} outerRadius={78} stroke="none" label={({name,value})=>`${name}: ${value}`}>{byStatus.map((x,i)=><Cell key={x.name} fill={COLORS[i%COLORS.length]}/>)}</Pie><Tooltip contentStyle={{background:'var(--surface)',border:'1px solid var(--border)',fontSize:10}}/></PieChart></ResponsiveContainer><div className="space-y-2">{devices.slice(0,5).map(d=><button key={d.ip} onClick={()=>nav(`/devices/${d.ip}`)} className="w-full flex justify-between text-[10px] hover:bg-white/[.02] px-2 py-1.5 rounded"><span className="truncate">{d.name}</span><span className="text-[var(--muted)]">{friendlyStatus(d.status)}</span></button>)}</div></>:<EmptyPanel message="No devices are registered."/>}</div></div></div>
+  <SectionLabel label="Recent Alerts"/><div className="space-y-2">{alerts.slice(0,5).map(a=><FriendlyAlertItem key={a.event_id} alert={a} expanded={expanded===a.event_id} onToggle={()=>setExpanded(expanded===a.event_id?null:a.event_id)}/>)}{!alerts.length&&<div className="panel"><EmptyPanel message="No alerts have been recorded."/></div>}</div>
+ </div>}
